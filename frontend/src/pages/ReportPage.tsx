@@ -311,6 +311,11 @@ export default function ReportPage() {
               {r.title}
             </motion.h1>
             <p className="mt-2 max-w-2xl text-aux text-white/85">{r.subtitle}</p>
+            {r.quality_status === 'needs_review' && (
+              <p role="status" className="mt-3 rounded-btn bg-white/95 p-3 text-aux text-risk">
+                待复核草稿：返工预算已用尽，仍有证据或论点问题。请查看核验结果，勿将待验证内容作为事实。
+              </p>
+            )}
             <div className="mt-3 flex flex-wrap items-center gap-4 text-tag text-white/75">
               <span className="inline-flex items-center gap-1"><Calendar size={13} /> {r.created_at}</span>
               <span className="inline-flex items-center gap-1"><Users size={13} /> {r.experts.length} 位专家</span>

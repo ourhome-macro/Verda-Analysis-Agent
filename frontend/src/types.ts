@@ -111,6 +111,11 @@ export interface Claim {
   confidence: 'high' | 'medium' | 'low' | 'unverified'
   cross_validated: boolean
   author: string
+  verification?: {
+    verdict: 'supported' | 'partial' | 'contradicted' | 'insufficient'
+    reason: string
+    supports: { evidence_id: string; quote: string; relation: string; start: number; end: number }[]
+  }
 }
 
 export interface ChartSpec {
@@ -206,6 +211,7 @@ export interface Report {
   metrics?: ReportMetrics
   quality_before?: Record<string, unknown>
   quality_after?: Record<string, unknown>
+  quality_status?: 'passed' | 'needs_review'
   audit_review?: AuditReview
   trace?: TraceSpan[]
 }

@@ -78,7 +78,7 @@ def fetch_page(url: str, *, fallback_snippet: str = "") -> Dict[str, Any]:
         images = _extract_images(html, url)
         og = _extract_og_image(html, url)
         result.update(
-            {"text": text[:4000], "images": images[:6], "og_image": og,
+            {"text": text[:48000], "images": images[:6], "og_image": og,
              "ok": True, "degraded": False}
         )
     except Exception:
@@ -92,7 +92,7 @@ def _extract_text(html: str) -> str:
     try:
         import trafilatura
 
-        out = trafilatura.extract(html, include_comments=False, include_tables=False)
+        out = trafilatura.extract(html, include_comments=False, include_tables=True)
         if out:
             return out.strip()
     except Exception:

@@ -24,6 +24,7 @@ class Evidence:
     brand: str = ""
     domain: str = ""
     freshness_days: Optional[int] = None  # 距今天数，None=无法解析
+    full_text: str = ""  # 保留抽取正文，供按问题选段与报告重载使用
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

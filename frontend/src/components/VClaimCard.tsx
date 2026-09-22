@@ -29,6 +29,20 @@ export function VClaimCard({
       className="rounded-card border border-line/60 bg-card p-4 shadow-card"
     >
       <p className="text-body text-ink">{claim.text}</p>
+      {claim.verification && (
+        <details className="mt-2 text-tag text-ink-2">
+          <summary className="cursor-pointer">
+            证据核验：{({ supported: '有原文支持', partial: '部分支持', contradicted: '存在矛盾', insufficient: '依据不足' })[claim.verification.verdict]}
+          </summary>
+          <p className="mt-2">{claim.verification.reason}</p>
+          {claim.verification.supports.map((s, i) => (
+            <blockquote key={`${s.evidence_id}-${i}`} className="mt-2 border-l-2 border-line pl-2">
+              {s.quote}
+              <button className="ml-2 underline" onClick={() => onCite?.([s.evidence_id])}>查看来源</button>
+            </blockquote>
+          ))}
+        </details>
+      )}
       <div className="mt-3 flex flex-wrap items-center gap-2">
         <span className={`inline-flex items-center gap-1 rounded-chip px-2.5 h-6 text-tag font-medium ${meta.cls}`}>
           <Icon size={12} /> {meta.label}

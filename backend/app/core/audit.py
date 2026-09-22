@@ -11,6 +11,8 @@ from typing import Any, Dict, List
 
 from app.core.fetcher import domain_of
 from app.core.models import Envelope
+from app.core.evidence_context import field_for
+from app.core.claim_verifier import supported_claims
 
 
 @dataclass
@@ -67,12 +69,12 @@ def evaluate_quality(
 
     # 1. 置信度比
     total = len(claims) or 1
-    high = sum(1 for c in claims if c.get("confidence") == "high")
+    verified = supported_claims(claims)
+    high = sum(1 for c in verified if c.get("confidence") == "high")
     qr.confidence_ratio = round(high / total, 3)
 
-    # 2. 维度覆盖：每个 focus 维度是否有 ≥1 条 medium/high claim
-    fields_present = {c.get("field") for c in claims
-                      if c.get("confidence") in ("high", "medium")}
+    # 2. 维度覆盖：每个 focus 维度是否有语义校验通过的对应论点（包括单源 low）。
+    fields_present = {c.get("field") for c in verified}
     for dim in focus:
         covered = False
         low = dim.lower()
@@ -80,9 +82,12 @@ def evaluate_quality(
             if f in fields_present and any(k in low for k in kws):
                 covered = True
                 break
-        # 兜底：只要有任意有效 claim 即视为该维度有所触及
-        if not covered and fields_present:
+        if field_for(dim) in fields_present:
             covered = True
+        # Unknown dimensions need an explicit field or literal topic match.
+        if not field_for(dim):
+            covered = any(c.get("field", "").lower() == low or low in c.get("text", "").lower()
+                          for c in verified)
         qr.coverage_by_dimension[dim] = covered
     covered_dims = sum(1 for v in qr.coverage_by_dimension.values() if v)
     qr.dimension_coverage_rate = round(covered_dims / (len(focus) or 1), 3)
@@ -129,6 +134,21 @@ def evaluate_quality(
             "raised_by": "L3-003",
         })
 
+    if not claims:
+        qr.issues.append({"issue_id": "no_claims", "target": "claims", "severity": "high",
+                          "reason": "没有生成可验证论点，需重新分析", "raised_by": "L3-003"})
+    for c in claims:
+        verification = c.get("verification", {})
+        if verification.get("verdict") == "supported":
+            continue
+        refs = set(c.get("evidence_ids", []))
+        affected = sorted({getattr(e, "brand", "") for e in evidences
+                           if getattr(e, "evidence_id", "") in refs} - {""}) or list(brands)
+        qr.issues.append({"issue_id": "claim_" + c["claim_id"], "target": "claim:" + c["claim_id"],
+                          "severity": "high", "reason": verification.get("reason", "论点未经证据校验"),
+                          "verdict": verification.get("verdict", "insufficient"),
+                          "brands": affected, "query": c.get("text", "")[:160],
+                          "field": c.get("field", ""), "raised_by": "L3-003"})
     return qr
 
 
@@ -219,21 +239,24 @@ def decide_rework(qr: QualityReport) -> List[Envelope]:
     envelopes: List[Envelope] = []
 
     # 证据不足 → 打回 collect 补采
-    collect_targets = [iss for iss in qr.issues if iss["target"].startswith("brand:")]
+    collect_targets = [iss for iss in qr.issues if iss["target"].startswith(("brand:", "claim:"))]
     if collect_targets:
-        brands_to_recollect = [iss["target"].split(":", 1)[1] for iss in collect_targets]
+        brands_to_recollect = list(dict.fromkeys(
+            b for iss in collect_targets for b in
+            ([iss["target"].split(":", 1)[1]] if iss["target"].startswith("brand:") else iss.get("brands", []))))
         envelopes.append(Envelope(
             msg_id="env_" + uuid.uuid4().hex[:8],
             sender="L3-003",
             receiver="collect",
             task_type="REWORK",
-            payload={"brands": brands_to_recollect, "reason": "证据不足，补充采集"},
+            payload={"brands": brands_to_recollect, "reason": "证据不足，补充采集",
+                     "queries": list(dict.fromkeys(iss["query"] for iss in collect_targets if iss.get("query")))[:3]},
             issues=collect_targets,
         ))
 
     # 维度缺失 / schema 不足 → 打回 analyze 重分析
     analyze_targets = [iss for iss in qr.issues
-                       if iss["target"].startswith("dimension:") or iss["target"] == "schema"]
+                       if iss["target"].startswith("dimension:") or iss["target"] in ("schema", "claims")]
     if analyze_targets:
         envelopes.append(Envelope(
             msg_id="env_" + uuid.uuid4().hex[:8],

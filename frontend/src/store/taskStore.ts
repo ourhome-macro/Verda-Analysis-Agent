@@ -24,6 +24,7 @@ export interface StreamMessage {
   text?: string
   members?: string[]
   claim?: Claim
+  claims?: Claim[]
   reason?: string
   diff?: { before: string; after: string }
   metrics_before?: Record<string, number>
@@ -147,6 +148,8 @@ export const useTaskStore = create<TaskState>((set, get) => ({
         if (msg.kind === 'team' && msg.members) patch.teamMembers = msg.members
         if (msg.kind === 'claim' && msg.claim)
           patch.claims = [...s.claims, msg.claim]
+        if (msg.kind === 'claims_replaced' && Array.isArray(msg.claims))
+          patch.claims = msg.claims
         set(patch)
         return
       }
