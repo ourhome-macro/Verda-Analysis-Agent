@@ -11,11 +11,13 @@ from __future__ import annotations
 import json
 import re
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any, Iterator, Optional
 
 from openai import OpenAI
 
-from app.core.config import get_settings
+from app.core.config import get_settings, has_request_settings
 from app.core import trace
 
 
@@ -24,6 +26,35 @@ class LLMNotConfigured(RuntimeError):
 
 
 _client: OpenAI | None = None
+_request_client: ContextVar[OpenAI | None] = ContextVar("verda_request_llm_client", default=None)
+
+
+@contextmanager
+def use_request_client():
+    """One pooled client per visitor request; close it when the request ends."""
+    if not has_request_settings():
+        yield
+        return
+    settings = get_settings()
+    provider = settings.provider_config
+    client = OpenAI(
+        api_key=provider.api_key,
+        base_url=provider.base_url,
+        timeout=settings.llm_timeout,
+        max_retries=settings.llm_max_retries,
+    )
+    token = _request_client.set(client)
+    try:
+        yield
+    finally:
+        _request_client.reset(token)
+        client.close()
+
+
+def reset_client() -> None:
+    """配置更新后让下一次请求使用新的 Key 和网关。"""
+    global _client
+    _client = None
 
 # 进程级 token 计数（供 progress 真实上报）
 TOKEN_USAGE = {"total": 0}
@@ -45,6 +76,11 @@ def _get_client() -> OpenAI:
         raise LLMNotConfigured(
             f"未配置 {provider.name} 模型服务，请在 backend/.env 中填写密钥、网关及模型。"
         )
+    if has_request_settings():
+        client = _request_client.get()
+        if client is None:
+            raise RuntimeError("Visitor LLM client scope is missing")
+        return client
     if _client is None:
         _client = OpenAI(
             api_key=provider.api_key,

@@ -11,12 +11,16 @@ import type {
   Subscription,
   TraceSpan,
 } from '../types'
+import { browserCredentialHeaders, readBrowserCredentials } from './browserCredentials'
+import { visitorHeaders } from './visitorIdentity'
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? ''
 
 async function safeJson<T>(path: string, init?: RequestInit, fallback?: T): Promise<T> {
   try {
-    const r = await fetch(`${API_BASE}${path}`, init)
+    const headers = new Headers(init?.headers)
+    for (const [name, value] of Object.entries(visitorHeaders())) headers.set(name, value)
+    const r = await fetch(`${API_BASE}${path}`, { ...init, headers })
     if (!r.ok) {
       const body = await r.json().catch(() => null) as { detail?: string } | null
       throw new Error(body?.detail || `HTTP ${r.status}`)
@@ -31,7 +35,7 @@ async function safeJson<T>(path: string, init?: RequestInit, fallback?: T): Prom
 /* 48 专家：优先后端，失败回退本地 JSON（绝不白屏） */
 export async function fetchExperts(): Promise<Expert[]> {
   try {
-    const r = await fetch(`${API_BASE}/api/experts`)
+    const r = await fetch(`${API_BASE}/api/experts`, { headers: visitorHeaders() })
     if (r.ok) {
       const data = await r.json()
       if (Array.isArray(data) && data.length) return data
@@ -49,7 +53,7 @@ export async function createTask(query: string, mode: string = 'deep'): Promise<
     '/api/tasks',
     {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...browserCredentialHeaders() },
       body: JSON.stringify({ query, mode }),
     },
   )
@@ -77,10 +81,45 @@ export interface LLMConfig {
   fast_model: string
   configured: boolean
   search_configured: boolean
+  editable: boolean
+  client_keys_required: boolean
 }
 
+export const LLM_CONFIG_UPDATED_EVENT = 'verda:llm-config-updated'
+export const OPEN_API_SETTINGS_EVENT = 'verda:open-api-settings'
+
 export async function fetchLLMConfig(): Promise<LLMConfig | null> {
-  return safeJson<LLMConfig | null>('/api/llm/config', undefined, null)
+  const server = await safeJson<LLMConfig | null>('/api/llm/config', { cache: 'no-store' }, null)
+  if (!server?.client_keys_required) return server
+  const credentials = readBrowserCredentials()
+  return {
+    ...server,
+    provider: 'deepseek',
+    model: 'deepseek-flash',
+    core_model: 'deepseek-v4-pro',
+    aux_model: 'deepseek-flash',
+    fast_model: 'deepseek-flash',
+    configured: Boolean(credentials.deepseekApiKey),
+    search_configured: Boolean(credentials.bochaApiKey),
+    editable: true,
+  }
+}
+
+export interface SaveLLMConfigBody {
+  provider: 'deepseek' | 'zhipu' | 'custom'
+  api_key?: string
+  bocha_api_key?: string
+  base_url?: string
+  model?: string
+}
+
+export async function saveLLMConfig(body: SaveLLMConfigBody): Promise<LLMConfig> {
+  return safeJson<LLMConfig>('/api/llm/config', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+    cache: 'no-store',
+  })
 }
 
 export async function fetchReport(reportId: string): Promise<Report | null> {
@@ -120,7 +159,7 @@ export async function refineSection(
     `/api/reports/${reportId}/refine`,
     {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...browserCredentialHeaders() },
       body: JSON.stringify({ section_id: sectionId, annotations }),
     },
     { ok: false, message: '请求失败' },
@@ -189,7 +228,10 @@ export interface SSEHandlers {
 
 export function openTaskStream(taskId: string, handlers: SSEHandlers): () => void {
   const url = `${API_BASE}/api/tasks/${taskId}/stream`
-  const es = new EventSource(url)
+  const controller = new AbortController()
+  let closed = false
+  let completed = false
+  let cursor = 0
   const types: SSEEventType[] = [
     'node_update',
     'thought',
@@ -203,22 +245,73 @@ export function openTaskStream(taskId: string, handlers: SSEHandlers): () => voi
     'done',
     'error',
   ]
-  es.onopen = () => handlers.onOpen?.()
-  for (const t of types) {
-    es.addEventListener(t, (ev) => {
-      let parsed: unknown = (ev as MessageEvent).data
+  function handleBlock(block: string) {
+    let eventType = ''
+    let eventId = 0
+    const data: string[] = []
+    for (const line of block.split('\n')) {
+      if (line.startsWith('id:')) eventId = Number(line.slice(3).trim()) || 0
+      if (line.startsWith('event:')) eventType = line.slice(6).trim()
+      if (line.startsWith('data:')) data.push(line.slice(5).trimStart())
+    }
+    if (!types.includes(eventType as SSEEventType)) return
+    if (eventId && eventId <= cursor) return
+    let parsed: unknown = data.join('\n')
+    try {
+      parsed = JSON.parse(data.join('\n'))
+    } catch {
+      /* keep raw text */
+    }
+    if (eventType === 'done' || eventType === 'error') completed = true
+    handlers.onEvent(eventType as SSEEventType, parsed)
+    if (eventId) cursor = eventId
+  }
+
+  void (async () => {
+    for (let attempt = 0; attempt < 4 && !closed && !completed; attempt++) {
       try {
-        parsed = JSON.parse((ev as MessageEvent).data)
-      } catch {
-        /* keep raw */
+        const response = await fetch(`${url}?after=${cursor}`, {
+          headers: { ...visitorHeaders(), ...browserCredentialHeaders() },
+          cache: 'no-store', signal: controller.signal,
+        })
+        if (!response.ok) {
+          const body = await response.json().catch(() => null) as { detail?: string } | null
+          throw new Error(body?.detail || `HTTP ${response.status}`)
+        }
+        if (!response.body) throw new Error('浏览器未提供任务流')
+        handlers.onOpen?.()
+        const reader = response.body.getReader()
+        const decoder = new TextDecoder()
+        let buffer = ''
+        while (!closed && !completed) {
+          const { done, value } = await reader.read()
+          if (done) break
+          buffer = (buffer + decoder.decode(value, { stream: true })).replace(/\r\n/g, '\n')
+          let boundary = buffer.indexOf('\n\n')
+          while (boundary >= 0) {
+            handleBlock(buffer.slice(0, boundary))
+            buffer = buffer.slice(boundary + 2)
+            boundary = buffer.indexOf('\n\n')
+          }
+        }
+        await reader.cancel().catch(() => {})
+        if (closed || completed) return
+        throw new Error('连接暂时中断，任务仍在后台执行')
+      } catch (error) {
+        if (closed || completed) return
+        if (attempt < 3) {
+          await new Promise((resolve) => setTimeout(resolve, 1000 * (attempt + 1)))
+          continue
+        }
+        handlers.onError?.(error)
+        handlers.onEvent('error', { message: '连接恢复失败；后台任务继续执行，可刷新工作台恢复观察' })
       }
-      handlers.onEvent(t, parsed)
-    })
+    }
+  })()
+  return () => {
+    closed = true
+    controller.abort()
   }
-  es.onerror = (e) => {
-    handlers.onError?.(e)
-  }
-  return () => es.close()
 }
 
 export { API_BASE }

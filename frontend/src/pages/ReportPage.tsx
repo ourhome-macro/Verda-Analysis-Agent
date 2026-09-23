@@ -32,6 +32,7 @@ import { VClaimCard } from '../components/VClaimCard'
 import { VSentimentPanel } from '../components/VSentimentPanel'
 import { VEvidenceCard } from '../components/VEvidenceFeed'
 import { VEditableBlock } from '../components/VEditableBlock'
+import { VInlineCitations } from '../components/VInlineCitations'
 import { VSelectionToolbar } from '../components/VSelectionToolbar'
 import { VMetricsPanel } from '../components/VMetricsPanel'
 import { VQualityGate } from '../components/VQualityGate'
@@ -223,15 +224,16 @@ export default function ReportPage() {
   const r = current
   // 证据 id → 序号（用于章节级溯源 chips）
   const evIndex = new Map(r.evidence.map((e, i) => [e.evidence_id, i + 1]))
+  const renderReportText = (text: string) => <VInlineCitations text={text} numbers={evIndex} onCite={jumpToEvidence} />
   // 关键指标速览（封面下方数据带，全部来自真实数据）
   const indepDomains = new Set(r.evidence.map((e) => e.domain).filter(Boolean)).size
   const highConf = r.claims.filter((c) => c.confidence === 'high').length
   const confRate = r.claims.length ? Math.round((highConf / r.claims.length) * 100) : 0
   const metrics = [
-    { icon: FileText, label: '核心结论', value: r.claims.length, unit: '条' },
+    { icon: FileText, label: '已核验结论', value: r.final_audit?.verified_claim_count ?? r.claims.length, unit: '条' },
     { icon: Database, label: '联网证据', value: r.evidence.length, unit: '条' },
-    { icon: Layers, label: '独立信源', value: indepDomains, unit: '个' },
-    { icon: ShieldCheck, label: '高置信占比', value: confRate, unit: '%' },
+    { icon: Layers, label: r.source_governance ? '原始来源组' : '域名数', value: r.source_governance?.original_source_groups ?? indepDomains, unit: '个' },
+    { icon: ShieldCheck, label: '高可信占比', value: confRate, unit: '%' },
   ]
 
   return (
@@ -294,11 +296,11 @@ export default function ReportPage() {
           <div className="h-full bg-primary transition-all duration-150" style={{ width: `${readProgress}%` }} />
         </div>
         {/* 杂志封面 */}
-        <div className="relative overflow-hidden">
+        <div className="relative min-h-[360px] overflow-hidden bg-primary-deep">
           <img
             src={r.cover_image ?? '/assets/brand/report-cover.png'}
             alt="cover"
-            className="h-60 w-full object-cover"
+            className="h-80 w-full object-cover opacity-40"
             onError={(e) => ((e.target as HTMLImageElement).style.display = 'none')}
           />
           <div className="absolute inset-0 bg-gradient-to-t from-ink/70 via-ink/20 to-transparent" />
@@ -310,7 +312,16 @@ export default function ReportPage() {
             >
               {r.title}
             </motion.h1>
-            <p className="mt-2 max-w-2xl text-aux text-white/85">{r.subtitle}</p>
+            <p className="mt-2 max-w-2xl text-aux text-white/85">
+              {r.source_governance ? `${r.evidence.length} 条证据 · ${r.source_governance.original_source_groups} 个原始来源组 · 一手正文占比 ${Math.round(r.source_governance.primary_source_ratio * 100)}%` : r.subtitle}
+            </p>
+            {r.final_audit && (
+              <div className="mt-3 rounded-btn bg-white/95 p-3 text-aux text-ink">
+                最终审校：{r.final_audit.status === 'passed' ? '发布内容已核验' : '待复核'} ·
+                核验 {r.final_audit.checked_units} 个文本单元 · {r.final_audit.verified_claim_count} 条已核验论点 ·
+                修订 {r.final_audit.repairs.length} 处。数据表可反查论点和来源。
+              </div>
+            )}
             {r.quality_status === 'needs_review' && (
               <p role="status" className="mt-3 rounded-btn bg-white/95 p-3 text-aux text-risk">
                 待复核草稿：返工预算已用尽，仍有证据或论点问题。请查看核验结果，勿将待验证内容作为事实。
@@ -382,6 +393,13 @@ export default function ReportPage() {
 
           {/* 效能与业务闭环指标 + 质检返工闭环 */}
           <VMetricsPanel metrics={r.metrics} />
+          {r.confidence_review && (
+            <div className="my-4 rounded-card border border-primary/30 bg-primary-tint/40 p-4 text-aux text-ink">
+              可信度已重新核验：{r.confidence_review.after.levels.high ?? 0} 条高可信，
+              {r.confidence_review.after.cross_validated} 条独立交叉验证。
+              <p className="mt-1 text-tag text-ink-2">两项指标分别计算。以下研究质检意见保留历史记录；本次复核已有原文快照，未刷新实时价格。</p>
+            </div>
+          )}
           <VAuditReview review={r.audit_review} />
           <VQualityGate before={r.quality_before} after={r.quality_after} />
           {r.sections.map((sec, idx) => (
@@ -399,6 +417,7 @@ export default function ReportPage() {
                   <VEditableBlock
                     as="p"
                     value={getEdit(rid, `${sec.id}-takeaway`) ?? sec.key_takeaway}
+                    renderValue={renderReportText}
                     editable={editMode}
                     onSave={(t) => setEdit(rid, `${sec.id}-takeaway`, t)}
                     className="text-body font-medium text-ink"
@@ -412,6 +431,7 @@ export default function ReportPage() {
                     key={i}
                     as="p"
                     value={getEdit(rid, `${sec.id}-p${i}`) ?? p}
+                    renderValue={renderReportText}
                     editable={editMode}
                     onSave={(t) => setEdit(rid, `${sec.id}-p${i}`, t)}
                     className="text-body leading-relaxed text-ink-2"
@@ -426,7 +446,7 @@ export default function ReportPage() {
                   {sec.highlights.map((h, i) => (
                     <li key={i} className="flex gap-2 text-aux text-ink-2">
                       <Sparkles size={15} className="mt-0.5 shrink-0 text-warn" />
-                      <span>{h}</span>
+                      <span>{renderReportText(h)}</span>
                     </li>
                   ))}
                 </ul>
@@ -653,7 +673,9 @@ export default function ReportPage() {
                 {r.glossary.map((g, i) => (
                   <div key={i} className="rounded-card border border-line/60 bg-bg p-3">
                     <div className="text-aux font-semibold text-ink">{g.term}</div>
-                    <p className="mt-1 text-tag leading-relaxed text-ink-2">{g.definition}</p>
+                    <p className="mt-1 text-tag leading-relaxed text-ink-2">{g.term === '交叉验证' && r.confidence_review
+                      ? '至少两个原始来源组各自支持完整结论；可信度单独判断，单一权威来源可以高可信但不能标为独立交叉验证。'
+                      : g.definition}</p>
                     {g.source && <div className="mt-1 text-tag text-primary-deep">— {g.source}</div>}
                   </div>
                 ))}

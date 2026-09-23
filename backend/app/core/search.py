@@ -13,6 +13,7 @@ import re
 from typing import List, Optional
 
 import httpx
+from app.core.source_policy import host_of, matches_domain, canonical_url
 
 from app.core.config import get_settings
 
@@ -132,6 +133,8 @@ def search_bocha(
         url = item.get("url", "")
         if not url:
             continue
+        if site and not any(matches_domain(host_of(url), d.strip()) for d in re.split(r"[|,]", site) if d.strip()):
+            continue  # Never silently accept results outside the requested domain policy.
         # summary（完整摘要，已开启）优先，缺失时退回 snippet
         snippet = (item.get("summary") or item.get("snippet") or "").strip()
         title = (item.get("name") or "").strip()
@@ -145,7 +148,7 @@ def search_bocha(
                 "snippet": snippet,
                 "source": item.get("siteName") or item.get("displayUrl", ""),
                 # 标准发布时间用 datePublished（dateLastCrawled 有 UTC+8 坑，不用）
-                "captured_at": item.get("datePublished") or _now(),
+                "captured_at": item.get("datePublished") or "",
             }
         )
         if len(results) >= count:
@@ -173,7 +176,7 @@ def multi_search(
         try:
             for r in search(q, num=num, site=site, freshness=freshness):
                 url = r.get("url", "")
-                key = url or r.get("title", "")
+                key = canonical_url(url) or r.get("title", "")
                 if not key or key in seen:
                     continue
                 seen.add(key)

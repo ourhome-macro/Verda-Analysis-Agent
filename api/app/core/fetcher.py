@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import urljoin, urlparse
 
 import httpx
+from app.core.source_policy import REGISTRY, host_of, matches_domain, publisher_key
 
 _UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
@@ -38,6 +39,9 @@ def fetch_page(url: str, *, fallback_snippet: str = "") -> Dict[str, Any]:
         "og_image": "",
         "ok": False,
         "degraded": True,
+        "fetch_kind": "snippet",
+        "origin_url": "",
+        "product_links": [],
     }
     try:
         with httpx.Client(
@@ -47,6 +51,7 @@ def fetch_page(url: str, *, fallback_snippet: str = "") -> Dict[str, Any]:
         ) as client:
             r = client.get(url)
             r.raise_for_status()
+            result["url"] = str(r.url)
             # 编码兜底：httpx 按响应头 charset 解码，遇错误声明会乱码。
             # 若检测到乱码，用 apparent_encoding（chardet/charset_normalizer）重解码。
             html = r.text
@@ -67,25 +72,80 @@ def fetch_page(url: str, *, fallback_snippet: str = "") -> Dict[str, Any]:
             except Exception:
                 pass
 
-        text = _extract_text(html) or fallback_snippet
+        text = _extract_text(html)
+        origin_url = _original_link(html, url)
+        product_links = []
+        fetch_kind = "body"
+        # Reviewed first-party sites commonly render pricing with JavaScript.
+        official = any(matches_domain(host_of(url), d) for p in REGISTRY.values() for d in p["domains"])
+        if official and (len(text) < 250 or "design" in url):
+            rendered = _render_official(url)
+            if len(rendered.get("text", "")) > len(text):
+                text, fetch_kind = rendered["text"], "rendered"
+                product_links = rendered.get("product_links", [])
+        extracted = bool(text.strip())
+        text = text or fallback_snippet
         # 乱码正文丢弃，退回 snippet
         try:
             from app.core.textquality import is_garbled
             if text and is_garbled(text):
                 text = fallback_snippet
+                extracted = False
         except Exception:
             pass
         images = _extract_images(html, url)
         og = _extract_og_image(html, url)
         result.update(
             {"text": text[:48000], "images": images[:6], "og_image": og,
-             "ok": True, "degraded": False}
+             "ok": extracted, "degraded": not extracted,
+             "fetch_kind": fetch_kind if extracted else "snippet", "origin_url": origin_url,
+             "product_links": product_links}
         )
     except Exception:
         # 降级保留 snippet
         pass
     result["captured_at"] = _now()
     return result
+
+
+def _original_link(html: str, base_url: str) -> str:
+    from bs4 import BeautifulSoup
+    import re
+    soup = BeautifulSoup(html, "html.parser")
+    for a in soup.find_all("a", href=True):
+        if re.search(r"原文链接|来源原文|转载自|original article|original source", a.get_text(" ", strip=True), re.I):
+            target = urljoin(base_url, a["href"])
+            if urlparse(target).scheme in ("http", "https"):
+                return target
+    return ""
+
+
+def _render_official(url: str) -> dict:
+    """Optional JS extraction, only called for reviewed first-party hosts."""
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            try:
+                page = browser.new_page(locale="zh-CN")
+                page.route("**/*", lambda route: route.abort() if route.request.resource_type in
+                           ("image", "media", "font") else route.continue_())
+                page.goto(url, wait_until="domcontentloaded", timeout=35000)
+                if publisher_key(page.url) != publisher_key(url):
+                    return {}
+                page.wait_for_timeout(3000)
+                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                page.wait_for_timeout(1000)
+                import re
+                hrefs = page.locator("a[href]").evaluate_all("els => els.map(a=>a.href)")
+                links = list(dict.fromkeys(h for h in hrefs if publisher_key(h) == publisher_key(url)
+                             and re.search(r"/models/|/(?:l[6789]|i[689]|mega)(?:/|$|\?)", h, re.I)))
+                return {"text": (page.title() + "\n" + page.locator("body").inner_text(timeout=5000))[:48000],
+                        "product_links": links[:6]}
+            finally:
+                browser.close()
+    except Exception:
+        return {}
 
 
 def _extract_text(html: str) -> str:

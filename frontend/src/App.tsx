@@ -13,12 +13,24 @@ import LibraryPage from './pages/LibraryPage'
 import DashboardPage from './pages/DashboardPage'
 import KnowledgePage from './pages/KnowledgePage'
 import { useExpertStore } from './store/expertStore'
+import { BROWSER_CREDENTIALS_KEY } from './lib/browserCredentials'
+import { LLM_CONFIG_UPDATED_EVENT } from './lib/api'
 
 export default function App() {
   const load = useExpertStore((s) => s.load)
   useEffect(() => {
     load()
   }, [load])
+
+  useEffect(() => {
+    const refreshAcrossTabs = (event: StorageEvent) => {
+      if (event.key === BROWSER_CREDENTIALS_KEY) {
+        window.dispatchEvent(new Event(LLM_CONFIG_UPDATED_EVENT))
+      }
+    }
+    window.addEventListener('storage', refreshAcrossTabs)
+    return () => window.removeEventListener('storage', refreshAcrossTabs)
+  }, [])
 
   return (
     <BrowserRouter>

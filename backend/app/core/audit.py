@@ -20,6 +20,7 @@ class QualityReport:
     coverage_by_dimension: Dict[str, bool] = field(default_factory=dict)
     coverage_by_brand: Dict[str, Dict[str, int]] = field(default_factory=dict)
     confidence_ratio: float = 0.0
+    independent_verification_ratio: float = 0.0
     schema_completeness: float = 0.0
     dimension_coverage_rate: float = 0.0
     brand_coverage_rate: float = 0.0
@@ -30,6 +31,7 @@ class QualityReport:
             "coverage_by_dimension": self.coverage_by_dimension,
             "coverage_by_brand": self.coverage_by_brand,
             "confidence_ratio": self.confidence_ratio,
+            "independent_verification_ratio": self.independent_verification_ratio,
             "schema_completeness": self.schema_completeness,
             "dimension_coverage_rate": self.dimension_coverage_rate,
             "brand_coverage_rate": self.brand_coverage_rate,
@@ -40,6 +42,7 @@ class QualityReport:
         """供前端返工卡片展示的精简指标。"""
         return {
             "confidence_ratio": round(self.confidence_ratio * 100),
+            "independent_verification_ratio": round(self.independent_verification_ratio * 100),
             "dimension_coverage": round(self.dimension_coverage_rate * 100),
             "brand_coverage": round(self.brand_coverage_rate * 100),
             "schema_completeness": round(self.schema_completeness * 100),
@@ -72,6 +75,7 @@ def evaluate_quality(
     verified = supported_claims(claims)
     high = sum(1 for c in verified if c.get("confidence") == "high")
     qr.confidence_ratio = round(high / total, 3)
+    qr.independent_verification_ratio = round(sum(bool(c.get("cross_validated")) for c in verified) / total, 3)
 
     # 2. 维度覆盖：每个 focus 维度是否有语义校验通过的对应论点（包括单源 low）。
     fields_present = {c.get("field") for c in verified}
@@ -99,14 +103,17 @@ def evaluate_quality(
         domains = {domain_of(getattr(e, "source_url", "")) for e in evs}
         domains.discard("")
         qr.coverage_by_brand[b] = {"evidence": len(evs), "domains": len(domains)}
-        if len(domains) >= min_indep_domains:
+        groups = {getattr(e, "source_group", "") or domain_of(e.source_url) for e in evs} - {""}
+        primary = sum(e.source_tier in ("official", "regulatory") and e.fetch_kind in ("body", "rendered") for e in evs)
+        qr.coverage_by_brand[b].update(independent_sources=len(groups), primary_sources=primary)
+        if primary or len(groups) >= min_indep_domains:
             brand_ok += 1
         else:
             qr.issues.append({
                 "issue_id": "is_" + uuid.uuid4().hex[:8],
                 "target": f"brand:{b}",
                 "severity": "high" if len(evs) == 0 else "medium",
-                "reason": f"「{b}」独立信源仅 {len(domains)} 个（<{min_indep_domains}），证据不足，建议补充采集。",
+                "reason": f"「{b}」无一手正文且独立原始来源仅 {len(groups)} 个，建议补充采集。",
                 "raised_by": "L3-003",
             })
     qr.brand_coverage_rate = round(brand_ok / (len(brands) or 1), 3)
@@ -170,7 +177,7 @@ def llm_quality_review(
 
     claim_lines = "\n".join(
         f"- [{c.get('confidence','?')}|{c.get('field','')}] {c.get('text','')}"
-        for c in claims[:18]
+        for c in claims[:24]
     ) or "（暂无论点）"
     sc_dims = "、".join(f"{k}:{'已覆盖' if v else '缺失'}"
                        for k, v in qr.coverage_by_dimension.items()) or "无"
@@ -195,6 +202,9 @@ def llm_quality_review(
             [
                 {"role": "system", "content": (
                     "你是竞品分析报告的质检官（L3 决策层）。请对下面这份『分析中间产物』做严格的质量审阅，"
+                    "此阶段是原子事实供给，不要求提前写出战略判断。官方一手正文足以支撑该品牌价格/配置事实，"
+                    "不要仅因单源导致低置信或缺少跨域引用就判返工；检查是否覆盖每个品牌及用户要求维度。"
+                    "事实可信程度与独立验证程度是不同指标：官方标价可以高可信且只有一个原始来源，不得混为事实准确率。"
                     "像券商内核/主编终审一样，逐维度打分（0-100 整数，要有真实差异、不要清一色整十），"
                     "指出具体问题，并给出可执行的改进建议。最后给整体结论 pass（达标）或 rework（需返工）。"
                     '只输出 JSON：{"verdict":"pass|rework",'

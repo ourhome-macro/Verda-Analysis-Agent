@@ -32,7 +32,7 @@ export function VMetricsPanel({ metrics }: { metrics?: ReportMetrics }) {
     {
       icon: Layers, label: '信息覆盖度', tint: 'text-info',
       value: cov.coverage_multiple != null ? `${cov.coverage_multiple}×` : '—',
-      sub: `${cov.independent_sources ?? 0} 个独立信源 · ${cov.platforms_covered ?? 0} 个平台`,
+      sub: `${cov.independent_sources ?? 0} 个域名（检索覆盖口径）· ${cov.platforms_covered ?? 0} 个平台`,
       tip: str(cov.formula),
     },
     {
@@ -42,9 +42,9 @@ export function VMetricsPanel({ metrics }: { metrics?: ReportMetrics }) {
       tip: str(con.formula),
     },
     {
-      icon: Gauge, label: '事实准确率', tint: 'text-warn',
-      value: pct(biz.accuracy),
-      sub: `交叉验证 ${pct(biz.cross_validated_ratio)} · 返工 ${biz.rework_rounds ?? 0} 轮`,
+      icon: Gauge, label: '高可信论点占比', tint: 'text-warn',
+      value: pct(biz.high_confidence_ratio ?? biz.accuracy),
+      sub: `独立交叉验证 ${pct(biz.cross_validated_ratio)} · 返工 ${biz.rework_rounds ?? 0} 轮`,
       tip: str(biz.formula),
     },
   ]

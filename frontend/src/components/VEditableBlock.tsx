@@ -67,6 +67,7 @@ export function VEditableBlock({
   className = '',
   as = 'p',
   highlights,
+  renderValue,
 }: {
   value: string
   editable: boolean
@@ -74,6 +75,7 @@ export function VEditableBlock({
   className?: string
   as?: 'p' | 'div'
   highlights?: InlineHighlight[]
+  renderValue?: (text: string) => React.ReactNode
 }) {
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState(value)
@@ -134,7 +136,7 @@ export function VEditableBlock({
 
   const Tag = as
   const content =
-    highlights && highlights.length > 0 ? renderWithHighlights(value, highlights) : value
+    highlights && highlights.length > 0 ? renderWithHighlights(value, highlights) : renderValue ? renderValue(value) : value
   return (
     <Tag
       className={`${className} ${

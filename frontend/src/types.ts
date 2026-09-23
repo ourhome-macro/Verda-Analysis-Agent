@@ -101,6 +101,10 @@ export interface Evidence {
   brand?: string
   domain?: string
   freshness_days?: number | null
+  source_tier?: string
+  source_group?: string
+  fetch_kind?: string
+  provenance_reason?: string
 }
 
 export interface Claim {
@@ -111,9 +115,20 @@ export interface Claim {
   confidence: 'high' | 'medium' | 'low' | 'unverified'
   cross_validated: boolean
   author: string
+  confidence_policy_version?: string
+  confidence_reason?: string
+  claim_kind?: 'declared_fact' | 'observed_fact' | 'comparison' | 'inference' | 'unknown'
+  independent_verification?: {
+    status: 'not_verified' | 'single_authority' | 'corroborated' | 'composite_support' | 'same_origin' | 'single_source'
+    source_count: number
+    full_support_source_count: number
+    evidence_count: number
+    credible_independent_source_count: number
+  }
   verification?: {
     verdict: 'supported' | 'partial' | 'contradicted' | 'insufficient'
     reason: string
+    assessment?: { claim_type: string; scope_complete: boolean; temporal_alignment: string; reason: string }
     supports: { evidence_id: string; quote: string; relation: string; start: number; end: number }[]
   }
 }
@@ -212,6 +227,15 @@ export interface Report {
   quality_before?: Record<string, unknown>
   quality_after?: Record<string, unknown>
   quality_status?: 'passed' | 'needs_review'
+  confidence_review?: {
+    policy_version: string
+    reviewed_at: string
+    before: {levels: Record<string, number>; supported: number; cross_validated: number}
+    after: {levels: Record<string, number>; supported: number; cross_validated: number; single_authority: number}
+    note: string
+  }
+  source_governance?: { primary_source_ratio: number; original_source_groups: number; policy_version: string; brands: Record<string, {evidence: number; primary: number}> }
+  final_audit?: { status: string; checked_units: number; accepted_units: number; verified_claim_count: number; repairs: {unit: string; action: string}[]; scope: string }
   audit_review?: AuditReview
   trace?: TraceSpan[]
 }
@@ -282,6 +306,10 @@ export interface DashboardStats {
   high_conf_total: number
   avg_evidence_per_report: number
   fact_accuracy: number
+  high_confidence_percent?: number | null
+  independent_verification_percent?: number | null
+  rated_claim_count?: number
+  confidence_scope?: string
   platform_distribution: Record<string, number>
   brand_distribution: Record<string, number>
   // 业务闭环聚合（真实，来自各报告 metrics）

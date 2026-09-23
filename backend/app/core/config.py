@@ -1,5 +1,7 @@
 """全局配置：统一选择 OpenAI 兼容的模型服务，密钥只从环境读取。"""
 import os
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Literal
@@ -11,7 +13,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 _BACKEND_DIR = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 )
-_ENV_FILE = os.path.join(_BACKEND_DIR, ".env")
+_ENV_FILE = os.environ.get("VERDA_ENV_FILE") or os.path.join(_BACKEND_DIR, ".env")
 
 
 @dataclass(frozen=True)
@@ -38,7 +40,7 @@ class Settings(BaseSettings):
     )
 
     # 统一入口。LLM_MODEL* 可覆盖当前 Provider 的默认模型。
-    llm_provider: Literal["zhipu", "deepseek", "custom"] = "zhipu"
+    llm_provider: Literal["zhipu", "deepseek", "custom"] = "deepseek"
     llm_api_key: str = ""
     llm_base_url: str = ""
     llm_model: str = ""
@@ -87,6 +89,8 @@ class Settings(BaseSettings):
     app_port: int = 8000
     frontend_origin: str = "http://localhost:5173"
     enable_demo_fallback: bool = True
+    local_settings_enabled: bool = False
+    require_client_api_keys: bool = False
 
     @property
     def provider_config(self) -> LLMProviderConfig:
@@ -120,6 +124,33 @@ class Settings(BaseSettings):
         return bool(provider.api_key and provider.base_url and provider.default_model)
 
 
+_REQUEST_SETTINGS: ContextVar[Settings | None] = ContextVar("verda_request_settings", default=None)
+
+
 @lru_cache
-def get_settings() -> Settings:
+def _base_settings() -> Settings:
     return Settings()
+
+
+def get_settings() -> Settings:
+    return _REQUEST_SETTINGS.get() or _base_settings()
+
+
+def clear_settings_cache() -> None:
+    _base_settings.cache_clear()
+
+
+def has_request_settings() -> bool:
+    return _REQUEST_SETTINGS.get() is not None
+
+
+@contextmanager
+def use_request_settings(settings: Settings | None):
+    if settings is None:
+        yield
+        return
+    token = _REQUEST_SETTINGS.set(settings)
+    try:
+        yield
+    finally:
+        _REQUEST_SETTINGS.reset(token)

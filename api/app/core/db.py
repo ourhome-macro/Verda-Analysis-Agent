@@ -10,6 +10,8 @@ import json
 import os
 import sqlite3
 import threading
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -39,6 +41,46 @@ _LOCK = threading.RLock()
 _LOCAL = threading.local()
 _SCHEMA_READY = False
 _SCHEMA_LOCK = threading.Lock()
+_VISITOR: ContextVar[str | None] = ContextVar("verda_visitor", default=None)
+
+
+@contextmanager
+def use_visitor(visitor_id: str | None):
+    token = _VISITOR.set(visitor_id)
+    try:
+        yield
+    finally:
+        _VISITOR.reset(token)
+
+
+def _owned(c: sqlite3.Connection, kind: str, resource_id: str) -> bool:
+    visitor = _VISITOR.get()
+    if visitor is None:
+        return True
+    return c.execute(
+        "SELECT 1 FROM visitor_resources WHERE kind=? AND resource_id=? AND owner_id=?",
+        (kind, resource_id, visitor),
+    ).fetchone() is not None
+
+
+def _remember_owner(c: sqlite3.Connection, kind: str, resource_id: str) -> None:
+    visitor = _VISITOR.get()
+    if visitor is None:
+        return
+    c.execute(
+        "INSERT OR IGNORE INTO visitor_resources(kind,resource_id,owner_id) VALUES(?,?,?)",
+        (kind, resource_id, visitor),
+    )
+    if not _owned(c, kind, resource_id):
+        raise PermissionError("Resource belongs to another visitor")
+
+
+def _scope(kind: str, id_column: str) -> tuple[str, tuple[str, ...]]:
+    visitor = _VISITOR.get()
+    if visitor is None:
+        return "", ()
+    return (f" AND EXISTS (SELECT 1 FROM visitor_resources vr WHERE vr.kind=? "
+            f"AND vr.resource_id={id_column} AND vr.owner_id=?)", (kind, visitor))
 
 
 def _now() -> str:
@@ -158,6 +200,23 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             data TEXT,
             updated_at TEXT
         );
+        CREATE TABLE IF NOT EXISTS visitor_resources (
+            kind TEXT NOT NULL,
+            resource_id TEXT NOT NULL,
+            owner_id TEXT NOT NULL,
+            PRIMARY KEY(kind, resource_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_visitor_resources_owner
+            ON visitor_resources(owner_id, kind);
+        CREATE TABLE IF NOT EXISTS visitor_expert_stats (
+            owner_id TEXT NOT NULL,
+            expert_id TEXT NOT NULL,
+            missions INTEGER DEFAULT 0,
+            claims_authored INTEGER DEFAULT 0,
+            evidence_collected INTEGER DEFAULT 0,
+            last_active TEXT,
+            PRIMARY KEY(owner_id, expert_id)
+        );
         """
     )
     conn.commit()
@@ -167,6 +226,7 @@ def _init_schema(conn: sqlite3.Connection) -> None:
 def save_task(task_id: str, query: str, clarifications: Dict[str, Any]) -> None:
     with _LOCK:
         c = _connect()
+        _remember_owner(c, "task", task_id)
         c.execute(
             "INSERT OR REPLACE INTO tasks(task_id,query,clarifications,status,created_at,report_id)"
             " VALUES(?,?,?,?,?,COALESCE((SELECT report_id FROM tasks WHERE task_id=?),NULL))",
@@ -178,6 +238,8 @@ def save_task(task_id: str, query: str, clarifications: Dict[str, Any]) -> None:
 def update_task_clarify(task_id: str, clarifications: Dict[str, Any]) -> None:
     with _LOCK:
         c = _connect()
+        if not _owned(c, "task", task_id):
+            raise PermissionError("Task is not accessible")
         c.execute(
             "UPDATE tasks SET clarifications=?, status='clarified' WHERE task_id=?",
             (json.dumps(clarifications, ensure_ascii=False), task_id),
@@ -187,6 +249,8 @@ def update_task_clarify(task_id: str, clarifications: Dict[str, Any]) -> None:
 
 def get_task(task_id: str) -> Optional[Dict[str, Any]]:
     c = _connect()
+    if not _owned(c, "task", task_id):
+        return None
     row = c.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
     if not row:
         return None
@@ -198,6 +262,8 @@ def get_task(task_id: str) -> Optional[Dict[str, Any]]:
 def mark_task_done(task_id: str, report_id: str) -> None:
     with _LOCK:
         c = _connect()
+        if not _owned(c, "task", task_id):
+            raise PermissionError("Task is not accessible")
         c.execute(
             "UPDATE tasks SET status='done', report_id=? WHERE task_id=?",
             (report_id, task_id),
@@ -212,6 +278,9 @@ def save_report(report: Dict[str, Any], task_id: str = "") -> None:
     high = sum(1 for c in claims if c.get("confidence") == "high")
     with _LOCK:
         c = _connect()
+        if task_id and not _owned(c, "task", task_id):
+            raise PermissionError("Task is not accessible")
+        _remember_owner(c, "report", report["id"])
         c.execute(
             "INSERT OR REPLACE INTO reports(report_id,task_id,title,subtitle,query,brands,experts,"
             "cover_image,data,evidence_count,claim_count,high_conf_count,created_at)"
@@ -242,6 +311,8 @@ def save_report(report: Dict[str, Any], task_id: str = "") -> None:
 
 def get_report(report_id: str) -> Optional[Dict[str, Any]]:
     c = _connect()
+    if not _owned(c, "report", report_id):
+        return None
     row = c.execute("SELECT data FROM reports WHERE report_id=?", (report_id,)).fetchone()
     if not row:
         return None
@@ -251,9 +322,11 @@ def get_report(report_id: str) -> Optional[Dict[str, Any]]:
 def list_reports() -> List[Dict[str, Any]]:
     """报告卡片列表（不含全文 data，省带宽）。"""
     c = _connect()
+    scope, args = _scope("report", "reports.report_id")
     rows = c.execute(
         "SELECT report_id,title,subtitle,query,brands,experts,cover_image,"
-        "evidence_count,claim_count,high_conf_count,created_at FROM reports ORDER BY created_at DESC"
+        "evidence_count,claim_count,high_conf_count,created_at FROM reports WHERE 1=1"
+        + scope + " ORDER BY created_at DESC", args
     ).fetchall()
     out = []
     for r in rows:
@@ -273,8 +346,9 @@ def query_evidences(
     limit: int = 200,
 ) -> List[Dict[str, Any]]:
     c = _connect()
-    sql = "SELECT * FROM evidences WHERE credibility>=?"
-    args: List[Any] = [min_cred]
+    scope, scope_args = _scope("report", "evidences.report_id")
+    sql = "SELECT * FROM evidences WHERE credibility>=?" + scope
+    args: List[Any] = [min_cred, *scope_args]
     if brand:
         sql += " AND brand=?"
         args.append(brand)
@@ -289,17 +363,20 @@ def query_evidences(
 def evidence_facets() -> Dict[str, Any]:
     """证据库聚合：平台分布 / 品牌分布 / 总量。"""
     c = _connect()
-    total = c.execute("SELECT COUNT(*) n FROM evidences").fetchone()["n"]
+    scope, args = _scope("report", "evidences.report_id")
+    total = c.execute("SELECT COUNT(*) n FROM evidences WHERE 1=1" + scope, args).fetchone()["n"]
     by_type = {
         r["source_type"]: r["n"]
         for r in c.execute(
-            "SELECT source_type, COUNT(*) n FROM evidences GROUP BY source_type"
+            "SELECT source_type, COUNT(*) n FROM evidences WHERE 1=1" + scope
+            + " GROUP BY source_type", args
         ).fetchall()
     }
     by_brand = {
         r["brand"]: r["n"]
         for r in c.execute(
-            "SELECT brand, COUNT(*) n FROM evidences WHERE brand!='' GROUP BY brand ORDER BY n DESC LIMIT 12"
+            "SELECT brand, COUNT(*) n FROM evidences WHERE brand!=''" + scope
+            + " GROUP BY brand ORDER BY n DESC LIMIT 12", args
         ).fetchall()
     }
     return {"total": total, "by_type": by_type, "by_brand": by_brand}
@@ -308,12 +385,14 @@ def evidence_facets() -> Dict[str, Any]:
 # ── 调研统计（真实仪表盘）─────────────────────────────────
 def dashboard_stats() -> Dict[str, Any]:
     c = _connect()
-    reports = c.execute("SELECT COUNT(*) n FROM reports").fetchone()["n"]
-    ev_total = c.execute("SELECT COUNT(*) n FROM evidences").fetchone()["n"]
-    claim_total = c.execute("SELECT COALESCE(SUM(claim_count),0) n FROM reports").fetchone()["n"]
-    high_total = c.execute("SELECT COALESCE(SUM(high_conf_count),0) n FROM reports").fetchone()["n"]
+    report_scope, report_args = _scope("report", "reports.report_id")
+    evidence_scope, evidence_args = _scope("report", "evidences.report_id")
+    reports = c.execute("SELECT COUNT(*) n FROM reports WHERE 1=1" + report_scope, report_args).fetchone()["n"]
+    ev_total = c.execute("SELECT COUNT(*) n FROM evidences WHERE 1=1" + evidence_scope, evidence_args).fetchone()["n"]
+    claim_total = c.execute("SELECT COALESCE(SUM(claim_count),0) n FROM reports WHERE 1=1" + report_scope, report_args).fetchone()["n"]
+    high_total = c.execute("SELECT COALESCE(SUM(high_conf_count),0) n FROM reports WHERE 1=1" + report_scope, report_args).fetchone()["n"]
     avg_ev = round(ev_total / reports, 1) if reports else 0
-    # 真实事实准确率 = 高置信结论占比
+    # Legacy mixed-policy rating ratio; not factual accuracy or corroboration.
     fact_rate = round(high_total / claim_total * 100) if claim_total else 0
     facets = evidence_facets()
     intel = intel_overview()
@@ -324,6 +403,10 @@ def dashboard_stats() -> Dict[str, Any]:
         "high_conf_total": high_total,
         "avg_evidence_per_report": avg_ev,
         "fact_accuracy": fact_rate,
+        "high_confidence_percent": intel["high_confidence_percent"],
+        "independent_verification_percent": intel["independent_verification_percent"],
+        "rated_claim_count": intel["rated_claim_count"],
+        "confidence_scope": "当前规则，最近60份可访问报告",
         "platform_distribution": facets["by_type"],
         "brand_distribution": facets["by_brand"],
         # 业务闭环聚合（真实，来自各报告 metrics）
@@ -342,21 +425,30 @@ def intel_overview() -> Dict[str, Any]:
     「累计节省人力（分钟）」「平均效率倍数」等可向评委解释的真实数字。
     """
     c = _connect()
+    scope, args = _scope("report", "reports.report_id")
     rows = c.execute(
         "SELECT report_id,title,query,brands,evidence_count,claim_count,"
-        "high_conf_count,created_at,data FROM reports ORDER BY created_at DESC LIMIT 60"
+        "high_conf_count,created_at,data FROM reports WHERE 1=1" + scope
+        + " ORDER BY created_at DESC LIMIT 60", args
     ).fetchall()
     cards: List[Dict[str, Any]] = []
     minutes_saved = 0.0
     eff_list: List[float] = []
     cov_list: List[float] = []
     total_tokens = 0
+    rated_claim_count = high_rated = independently_verified = 0
+    from app.core.confidence_policy import CONFIDENCE_POLICY_VERSION
     for r in rows:
         try:
             data = json.loads(r["data"]) if r["data"] else {}
         except Exception:
             data = {}
         m = data.get("metrics") or {}
+        current_claims = [cl for cl in data.get("claims", []) if isinstance(cl, dict)
+                          and cl.get("confidence_policy_version") == CONFIDENCE_POLICY_VERSION]
+        rated_claim_count += len(current_claims)
+        high_rated += sum(cl.get("confidence") == "high" for cl in current_claims)
+        independently_verified += sum(bool(cl.get("cross_validated")) for cl in current_claims)
         eff = (m.get("efficiency") or {})
         cov = (m.get("coverage") or {})
         manual_min = float(eff.get("manual_estimate_minutes") or 0)
@@ -389,6 +481,9 @@ def intel_overview() -> Dict[str, Any]:
         "avg_coverage": round(sum(cov_list) / len(cov_list), 1) if cov_list else 0,
         "total_tokens": total_tokens,
         "cards": cards,
+        "rated_claim_count": rated_claim_count,
+        "high_confidence_percent": round(high_rated / rated_claim_count * 100, 1) if rated_claim_count else None,
+        "independent_verification_percent": round(independently_verified / rated_claim_count * 100, 1) if rated_claim_count else None,
     }
 
 
@@ -398,6 +493,7 @@ def intel_overview() -> Dict[str, Any]:
 def create_subscription(sub_id: str, query: str, brands: List[str]) -> Dict[str, Any]:
     with _LOCK:
         c = _connect()
+        _remember_owner(c, "subscription", sub_id)
         c.execute(
             "INSERT OR REPLACE INTO subscriptions(sub_id,query,brands,created_at,last_run_at,last_report_id,run_count)"
             " VALUES(?,?,?,?,?,?,?)",
@@ -409,7 +505,9 @@ def create_subscription(sub_id: str, query: str, brands: List[str]) -> Dict[str,
 
 def list_subscriptions() -> List[Dict[str, Any]]:
     c = _connect()
-    rows = c.execute("SELECT * FROM subscriptions ORDER BY created_at DESC").fetchall()
+    scope, args = _scope("subscription", "subscriptions.sub_id")
+    rows = c.execute("SELECT * FROM subscriptions WHERE 1=1" + scope
+                     + " ORDER BY created_at DESC", args).fetchall()
     out = []
     for r in rows:
         d = dict(r)
@@ -420,6 +518,8 @@ def list_subscriptions() -> List[Dict[str, Any]]:
 
 def get_subscription(sub_id: str) -> Optional[Dict[str, Any]]:
     c = _connect()
+    if not _owned(c, "subscription", sub_id):
+        return None
     row = c.execute("SELECT * FROM subscriptions WHERE sub_id=?", (sub_id,)).fetchone()
     if not row:
         return None
@@ -431,6 +531,8 @@ def get_subscription(sub_id: str) -> Optional[Dict[str, Any]]:
 def delete_subscription(sub_id: str) -> None:
     with _LOCK:
         c = _connect()
+        if not _owned(c, "subscription", sub_id):
+            raise PermissionError("Subscription is not accessible")
         c.execute("DELETE FROM subscriptions WHERE sub_id=?", (sub_id,))
         c.commit()
 
@@ -438,6 +540,8 @@ def delete_subscription(sub_id: str) -> None:
 def mark_subscription_run(sub_id: str, report_id: str) -> None:
     with _LOCK:
         c = _connect()
+        if not _owned(c, "subscription", sub_id):
+            raise PermissionError("Subscription is not accessible")
         c.execute(
             "UPDATE subscriptions SET last_run_at=?, last_report_id=?, run_count=run_count+1 WHERE sub_id=?",
             (_now(), report_id, sub_id),
@@ -454,33 +558,50 @@ def bump_expert_stats(
     claims_by_author = claims_by_author or {}
     evidence_by_collector = evidence_by_collector or {}
     ids = set(expert_ids) | set(claims_by_author) | set(evidence_by_collector)
+    visitor = _VISITOR.get()
     with _LOCK:
         c = _connect()
         for eid in ids:
-            c.execute(
-                "INSERT INTO expert_stats(expert_id,missions,claims_authored,evidence_collected,last_active)"
-                " VALUES(?,?,?,?,?)"
-                " ON CONFLICT(expert_id) DO UPDATE SET"
-                " missions=missions+excluded.missions,"
-                " claims_authored=claims_authored+excluded.claims_authored,"
-                " evidence_collected=evidence_collected+excluded.evidence_collected,"
-                " last_active=excluded.last_active",
-                (
-                    eid,
-                    1 if eid in expert_ids else 0,
-                    claims_by_author.get(eid, 0),
-                    evidence_by_collector.get(eid, 0),
-                    _now(),
-                ),
-            )
+            if visitor is None:
+                c.execute(
+                    "INSERT INTO expert_stats(expert_id,missions,claims_authored,evidence_collected,last_active)"
+                    " VALUES(?,?,?,?,?)"
+                    " ON CONFLICT(expert_id) DO UPDATE SET"
+                    " missions=missions+excluded.missions,"
+                    " claims_authored=claims_authored+excluded.claims_authored,"
+                    " evidence_collected=evidence_collected+excluded.evidence_collected,"
+                    " last_active=excluded.last_active",
+                    (eid, 1 if eid in expert_ids else 0,
+                     claims_by_author.get(eid, 0), evidence_by_collector.get(eid, 0), _now()),
+                )
+            else:
+                c.execute(
+                    "INSERT INTO visitor_expert_stats(owner_id,expert_id,missions,claims_authored,"
+                    "evidence_collected,last_active) VALUES(?,?,?,?,?,?)"
+                    " ON CONFLICT(owner_id,expert_id) DO UPDATE SET"
+                    " missions=missions+excluded.missions,"
+                    " claims_authored=claims_authored+excluded.claims_authored,"
+                    " evidence_collected=evidence_collected+excluded.evidence_collected,"
+                    " last_active=excluded.last_active",
+                    (visitor, eid, 1 if eid in expert_ids else 0,
+                     claims_by_author.get(eid, 0), evidence_by_collector.get(eid, 0), _now()),
+                )
         c.commit()
 
 
 def expert_workload() -> List[Dict[str, Any]]:
     c = _connect()
-    rows = c.execute(
-        "SELECT * FROM expert_stats ORDER BY missions DESC, claims_authored DESC"
-    ).fetchall()
+    visitor = _VISITOR.get()
+    if visitor is None:
+        rows = c.execute(
+            "SELECT * FROM expert_stats ORDER BY missions DESC, claims_authored DESC"
+        ).fetchall()
+    else:
+        rows = c.execute(
+            "SELECT expert_id,missions,claims_authored,evidence_collected,last_active "
+            "FROM visitor_expert_stats WHERE owner_id=? ORDER BY missions DESC,claims_authored DESC",
+            (visitor,),
+        ).fetchall()
     return [dict(r) for r in rows]
 
 
@@ -490,6 +611,8 @@ def save_traces(task_id: str, report_id: str, spans: List[Dict[str, Any]]) -> No
         return
     with _LOCK:
         c = _connect()
+        if not _owned(c, "task", task_id):
+            raise PermissionError("Task is not accessible")
         for s in spans:
             c.execute(
                 "INSERT OR REPLACE INTO traces(span_id,task_id,report_id,seq,agent_id,stage,"
@@ -511,6 +634,8 @@ def save_traces(task_id: str, report_id: str, spans: List[Dict[str, Any]]) -> No
 
 def get_traces_by_task(task_id: str) -> List[Dict[str, Any]]:
     c = _connect()
+    if not _owned(c, "task", task_id):
+        return []
     rows = c.execute("SELECT * FROM traces WHERE task_id=? ORDER BY seq", (task_id,)).fetchall()
     out = []
     for r in rows:
@@ -522,6 +647,8 @@ def get_traces_by_task(task_id: str) -> List[Dict[str, Any]]:
 
 def get_traces_by_report(report_id: str) -> List[Dict[str, Any]]:
     c = _connect()
+    if not _owned(c, "report", report_id):
+        return []
     rows = c.execute("SELECT * FROM traces WHERE report_id=? ORDER BY seq", (report_id,)).fetchall()
     out = []
     for r in rows:
@@ -536,6 +663,8 @@ def save_report_feedback(report_id: str, edited_blocks: int, total_blocks: int,
                          data: Dict[str, Any]) -> None:
     with _LOCK:
         c = _connect()
+        if not _owned(c, "report", report_id):
+            raise PermissionError("Report is not accessible")
         c.execute(
             "INSERT OR REPLACE INTO report_feedback(report_id,edited_blocks,total_blocks,data,updated_at)"
             " VALUES(?,?,?,?,?)",
@@ -547,6 +676,8 @@ def save_report_feedback(report_id: str, edited_blocks: int, total_blocks: int,
 
 def get_report_feedback(report_id: str) -> Optional[Dict[str, Any]]:
     c = _connect()
+    if not _owned(c, "report", report_id):
+        return None
     row = c.execute("SELECT * FROM report_feedback WHERE report_id=?", (report_id,)).fetchone()
     if not row:
         return None

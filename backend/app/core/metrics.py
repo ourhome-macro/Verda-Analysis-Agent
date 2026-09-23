@@ -49,7 +49,7 @@ def compute_report_metrics(
     sc = schema_completeness(structured)
     consistency = round(0.5 * (claims_with_evidence / total_claims) + 0.5 * sc, 3)
 
-    # 准确率 = 高置信占比
+    # Legacy field 'accuracy' remains an alias, NOT measured factual accuracy.
     accuracy = round(high_conf / total_claims, 3)
     cross_ratio = round(cross_validated / total_claims, 3)
 
@@ -82,14 +82,15 @@ def compute_report_metrics(
         },
         # 业务闭环指标
         "business": {
-            "accuracy": accuracy,                       # 准确率=高置信占比
+            "accuracy": accuracy,                       # 兼容旧字段
+            "high_confidence_ratio": accuracy,
             "cross_validated_ratio": cross_ratio,        # 交叉验证占比
             "dimension_coverage": None,                  # 由 quality 注入
             "brand_coverage": None,                      # 由 quality 注入
             "correction_rate": None,                     # 由人工反馈注入
             "rework_rounds": rework_rounds,
             "issues_resolved": issues_resolved,
-            "formula": "准确率=高置信论点÷总论点；人工修正率=被编辑块÷可编辑块（用户反馈后更新）",
+            "formula": "高可信占比=高可信论点÷总论点（不是事实准确率）；独立验证占比单独统计；人工修正率=被编辑块÷可编辑块",
         },
     }
 

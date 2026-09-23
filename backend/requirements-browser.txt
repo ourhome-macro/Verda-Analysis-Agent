@@ -1,0 +1,3 @@
+# Optional rendered extraction and local frontend acceptance testing.
+-r requirements.txt
+playwright==1.63.0

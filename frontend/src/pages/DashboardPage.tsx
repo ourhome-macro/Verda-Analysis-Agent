@@ -200,15 +200,17 @@ export default function DashboardPage() {
         <>
           {/* 1. 情报资产总览 */}
           <motion.div variants={stagger} initial="initial" animate="animate"
-            className="mt-6 grid grid-cols-2 gap-5 sm:grid-cols-4">
+            className="mt-6 grid grid-cols-2 gap-5 sm:grid-cols-5">
             <StatCard icon={Target} value={coveredBrands} label="覆盖竞品"
               tip="已有情报沉淀的竞品数量，覆盖越广战场视野越全" />
             <StatCard icon={Database} value={stats!.evidence_total} label="情报证据"
               tip={`累计联网取证，平均每篇报告 ${stats!.avg_evidence_per_report} 条`} />
             <StatCard icon={Sparkles} value={stats!.claim_total} label="产出结论"
               tip="全部报告输出的分析结论总数" />
-            <StatCard icon={ShieldCheck} value={stats!.fact_accuracy} unit="%" color="text-ok"
-              label="交叉验证率" tip="经 ≥2 个独立来源相互印证的结论占比（真实计算，越高越可信）" />
+            <StatCard icon={ShieldCheck} value={stats!.high_confidence_percent ?? null} unit="%" color="text-ok"
+              label="高可信占比" tip={`${stats!.confidence_scope ?? '当前规则'}，共 ${stats!.rated_claim_count ?? 0} 条已评级论点；不是事实准确率`} />
+            <StatCard icon={ShieldCheck} value={stats!.independent_verification_percent ?? null} unit="%" color="text-info"
+              label="独立验证占比" tip="同口径统计多个原始来源各自完整支持的比例；不会用高可信占比代替" />
           </motion.div>
 
           {/* 1.5 业务闭环价值（相比人工的真实可量化提升）*/}
@@ -268,7 +270,7 @@ export default function DashboardPage() {
                       <div className="mt-3 grid grid-cols-3 gap-2 text-center">
                         <Mini label="证据" value={`${rc.evidence_count}`} />
                         <Mini label="结论" value={`${rc.claim_count}`} />
-                        <Mini label="高置信" value={`${rc.high_conf_count}`} />
+                        <Mini label="高评级" value={`${rc.high_conf_count}`} />
                         <Mini label="效率" value={rc.efficiency_multiple ? `${rc.efficiency_multiple}×` : '—'} accent />
                         <Mini label="省时" value={rc.minutes_saved ? `${Math.round(rc.minutes_saved)}m` : '—'} accent />
                         <Mini label="耗时" value={rc.elapsed_minutes ? `${rc.elapsed_minutes}m` : '—'} />
@@ -516,7 +518,7 @@ export default function DashboardPage() {
 
 function StatCard({ icon: Icon, value, label, tip, unit, color = 'text-primary' }: {
   icon: typeof FileText
-  value: number
+  value: number | null
   label: string
   tip: string
   unit?: string
@@ -529,7 +531,7 @@ function StatCard({ icon: Icon, value, label, tip, unit, color = 'text-primary' 
           <Icon size={18} />
         </span>
         <div className="mt-3 flex items-end gap-0.5">
-          <span className="font-serif text-[32px] leading-none text-ink"><VCountUp value={value} /></span>
+          <span className="font-serif text-[32px] leading-none text-ink">{value == null ? '—' : <VCountUp value={value} />}</span>
           {unit && <span className="mb-1 text-h3 text-ink-2">{unit}</span>}
         </div>
         <div className="mt-1 text-aux font-medium text-ink">{label}</div>

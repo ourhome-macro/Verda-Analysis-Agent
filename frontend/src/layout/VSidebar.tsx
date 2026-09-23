@@ -9,7 +9,9 @@ import {
   ChevronDown,
   Library,
 } from 'lucide-react'
-import { fetchDashboard } from '../lib/api'
+import { fetchDashboard, fetchLLMConfig, LLM_CONFIG_UPDATED_EVENT, OPEN_API_SETTINGS_EVENT } from '../lib/api'
+import type { LLMConfig } from '../lib/api'
+import VApiSettingsDialog from '../components/VApiSettingsDialog'
 
 const navItems = [
   { to: '/', label: '工作台', icon: Home, end: true },
@@ -23,6 +25,18 @@ export default function VSidebar() {
   const navigate = useNavigate()
   const [reports, setReports] = useState(0)
   const [evidence, setEvidence] = useState(0)
+  const [settingsOpen, setSettingsOpen] = useState(false)
+  const [openingSettings, setOpeningSettings] = useState(false)
+  const [llmConfig, setLLMConfig] = useState<LLMConfig | null>(null)
+
+  async function openSettings() {
+    if (openingSettings) return
+    setOpeningSettings(true)
+    const latest = await fetchLLMConfig()
+    setLLMConfig(latest)
+    setSettingsOpen(true)
+    setOpeningSettings(false)
+  }
 
   useEffect(() => {
     fetchDashboard().then((d) => {
@@ -31,6 +45,17 @@ export default function VSidebar() {
         setEvidence(d.evidence_total)
       }
     })
+  }, [])
+
+  useEffect(() => {
+    const openFromBanner = () => {
+      void fetchLLMConfig().then((latest) => {
+        setLLMConfig(latest)
+        setSettingsOpen(true)
+      })
+    }
+    window.addEventListener(OPEN_API_SETTINGS_EVENT, openFromBanner)
+    return () => window.removeEventListener(OPEN_API_SETTINGS_EVENT, openFromBanner)
   }, [])
 
   return (
@@ -87,7 +112,9 @@ export default function VSidebar() {
       </div>
 
       {/* 底部用户 */}
-      <div className="flex items-center gap-3 border-t border-line px-4 py-3.5">
+      <button type="button" onClick={() => { void openSettings() }} disabled={openingSettings}
+        aria-label="打开模型与搜索配置"
+        className="flex w-full items-center gap-3 border-t border-line px-4 py-3.5 text-left hover:bg-primary-tint/50 disabled:opacity-60">
         <span className="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-sun text-[13px] font-semibold text-ink">
           研
         </span>
@@ -96,7 +123,12 @@ export default function VSidebar() {
           <div className="truncate text-tag text-ink-3">青野科技</div>
         </div>
         <ChevronDown size={16} className="text-ink-3" />
-      </div>
+      </button>
+      {settingsOpen && <VApiSettingsDialog config={llmConfig} onClose={() => setSettingsOpen(false)}
+        onSaved={(updated) => {
+          setLLMConfig(updated)
+          window.dispatchEvent(new Event(LLM_CONFIG_UPDATED_EVENT))
+        }} />}
     </aside>
   )
 }

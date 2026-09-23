@@ -83,7 +83,7 @@ export default function LibraryPage() {
                   <span className="inline-flex items-center gap-1"><Clock size={12} /> {r.created_at}</span>
                   <span className="inline-flex items-center gap-1"><FileText size={12} /> {r.evidence_count} 证据</span>
                   <span className="inline-flex items-center gap-1 text-primary-deep">
-                    <ShieldCheck size={12} /> {r.high_conf_count} 高置信
+                    <ShieldCheck size={12} /> {r.high_conf_count} 高评级
                   </span>
                   <span
                     className="ml-auto inline-flex items-center gap-1 text-primary-deep"

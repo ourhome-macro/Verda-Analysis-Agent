@@ -1,4 +1,4 @@
-# Vercel Python Serverless 运行时依赖（精简版，仅保留运行时真正 import 的包）
+# 生产运行时依赖（Vercel 与 Docker 共用，仅保留实际 import 的包）
 fastapi==0.115.6
 pydantic==2.10.4
 pydantic-settings==2.7.1

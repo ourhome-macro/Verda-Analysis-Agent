@@ -18,7 +18,7 @@ import {
 import { VSunGlow } from '../components/ui'
 import { fadeUp, stagger } from '../lib/motion'
 import { useExpertStore } from '../store/expertStore'
-import { createTask, fetchLLMConfig } from '../lib/api'
+import { createTask, fetchLLMConfig, LLM_CONFIG_UPDATED_EVENT } from '../lib/api'
 import type { LLMConfig } from '../lib/api'
 
 const MODE_OPTIONS = [
@@ -57,7 +57,10 @@ const EXAMPLES = [
 function ModelStatus() {
   const [config, setConfig] = useState<LLMConfig | null>(null)
   useEffect(() => {
-    void fetchLLMConfig().then(setConfig)
+    const refresh = () => { void fetchLLMConfig().then(setConfig) }
+    refresh()
+    window.addEventListener(LLM_CONFIG_UPDATED_EVENT, refresh)
+    return () => window.removeEventListener(LLM_CONFIG_UPDATED_EVENT, refresh)
   }, [])
   const label = config
     ? `${config.provider === 'deepseek' ? 'DeepSeek' : config.provider === 'zhipu' ? '智谱' : '自定义'} · ${config.core_model}`

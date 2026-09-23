@@ -10,18 +10,40 @@ import re
 from typing import Callable
 
 from app.core.evidence_context import EvidenceContext
-from app.core.fetcher import domain_of
 from app.core.llm import chat_json
+from app.core.source_policy import admission
+from app.core.confidence_policy import assess_confidence, empty_assessment, CONFIDENCE_POLICY_VERSION
 
 
-def _numbers(text: str) -> set[str]:
+def _numbers(text: str, *, conversions: bool = False) -> set[str]:
     from decimal import Decimal, InvalidOperation
     result = set()
-    for item in re.findall(r"\d+(?:,\d{3})*(?:\.\d+)?", text):
+    # Model identifiers (L6, M100, Model 3, 海狮08) are entities, not quantities.
+    # Their identity is checked by the entailment model; this guard checks amounts.
+    quantities = re.sub(r"\bModel\s+\d+\b|(?:海狮|海豹)\d+", "车型", text, flags=re.I)
+    for item in re.findall(r"(?<![A-Za-z0-9])\d+(?:,\d{3})*(?:\.\d+)?", quantities):
         try:
             result.add(str(Decimal(item.replace(",", "")).normalize()))
         except InvalidOperation:
             continue
+    if not conversions:
+        return result
+    # Expand the SOURCE side only; generated prose must not add its own proof.
+    # Ordinary years/model numbers/ranges are never scaled implicitly.
+    for amount, unit in re.findall(r"(\d+(?:,\d{3})*(?:\.\d+)?)\s*(万元|万美元|万欧元|万公里|元|美元|欧元|公里)", text):
+        number = Decimal(amount.replace(",", ""))
+        converted = number * 10000 if unit.startswith("万") else number / 10000
+        result.add(str(converted.normalize()))
+    for amount in re.findall(r"[￥¥$€]\s*(\d+(?:,\d{3})*(?:\.\d+)?)", text):
+        result.add(str((Decimal(amount.replace(",", "")) / 10000).normalize()))
+    number_pattern = r"(\d+(?:,\d{3})*(?:\.\d+)?)"
+    for left, right in re.findall(r"[￥¥$€]\s*" + number_pattern + r"\s*[-–—~至]\s*" + number_pattern, text):
+        for amount in (left, right):
+            result.add(str((Decimal(amount.replace(",", "")) / 10000).normalize()))
+    for left, right, unit in re.findall(number_pattern + r"\s*[-–—~至]\s*" + number_pattern + r"\s*(万元|元)", text):
+        for amount in (left, right):
+            n = Decimal(amount.replace(",", ""))
+            result.add(str((n * 10000 if unit == "万元" else n / 10000).normalize()))
     return result
 
 
@@ -38,6 +60,8 @@ def verify_claims(claims: list[dict], context: EvidenceContext, *,
         refs = refs if isinstance(refs, list) else []
         copy["evidence_ids"] = list(dict.fromkeys(e for e in refs if isinstance(e, str) and e in by_id))[:6]
         copy.update(confidence="unverified", cross_validated=False,
+                    confidence_policy_version=CONFIDENCE_POLICY_VERSION,
+                    confidence_reason="未完成支持性和来源核验", independent_verification=empty_assessment(),
                     verification={"verdict": "insufficient", "reason": "未完成支持性校验", "supports": []})
         output.append(copy)
 
@@ -59,7 +83,14 @@ def verify_claims(claims: list[dict], context: EvidenceContext, *,
                     "每条引用分别标 supports（单独支持整个Claim）/partial（仅支持部分）/contradicts。"
                     "组合多个partial可支持整个Claim，但不是多源独立验证。原文矛盾时必须contradicted，不能只挑支持证据。"
                     "quote必须逐字复制对应片段，禁止改写或拼接。没有支持原文不能判supported。"
+                    "引句必须覆盖结论的全部数字（包括车型编号、年款、币种和时间）；必要时对同一证据返回多条引句。"
+                    "另评估assessment：claim_type为declared_fact（官网标价、明示配置、财报披露等声明性事实）、"
+                    "observed_fact（实际成交、独立实测）、comparison（比较优劣）、inference（分析推断）。"
+                    "scope_complete仅当主体、版本、地区、价格或测量口径、适用条件完整且无过度概括时为true。"
+                    "temporal_alignment为consistent/unknown/conflicting：基于来源快照或明确历史期的陈述可一致；"
+                    "声称当前/最新但日期不足、把历史资料说成现价时不得consistent。厂家宣传最安全不等于客观最安全。"
                     '只输出JSON：{"results":[{"claim_id":"...","verdict":"supported",'
+                    '"assessment":{"claim_type":"declared_fact","scope_complete":true,"temporal_alignment":"consistent","reason":"适用范围与时间依据"},'
                     '"reason":"包含比较口径与缺失条件的简短说明","supports":[{"evidence_id":"...",'
                     '"quote":"原文片段","relation":"supports|partial|contradicts"}]}]}'
                 )}, {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
@@ -92,11 +123,14 @@ def verify_claims(claims: list[dict], context: EvidenceContext, *,
                         relation not in ("supports", "partial", "contradicts")):
                     invalid = True
                     continue
-                p = next((p for p in by_id[eid] if quote in p["text"]), None)
-                if p is None:
+                match = next(((p, located) for p in by_id[eid]
+                              if (located := locate_quote(p["text"], quote)) is not None), None)
+                if match is None:
                     invalid = True
                     continue
-                start = p["start"] + p["text"].index(quote)
+                p, (relative_start, relative_end) = match
+                quote = p["text"][relative_start:relative_end]
+                start = p["start"] + relative_start
                 anchored.append({"evidence_id": eid, "quote": quote, "relation": relation,
                                  "start": start, "end": start + len(quote)})
             reason = str(row.get("reason", ""))[:600]
@@ -104,20 +138,49 @@ def verify_claims(claims: list[dict], context: EvidenceContext, *,
                 verdict = "contradicted"
             elif verdict == "supported" and (invalid or not anchored):
                 verdict, reason = "insufficient", "核验引用缺失或不在模型可见原文中"
-            elif verdict == "supported" and not _numbers(c["text"]) <= _numbers(" ".join(s["quote"] for s in anchored)):
+            elif verdict == "supported" and not _numbers(c["text"]) <= _numbers(" ".join(s["quote"] for s in anchored), conversions=True):
                 verdict, reason = "partial", "结论包含原文引句中未出现的数字，需要补充依据或计算过程"
-            c["verification"] = {"verdict": verdict, "reason": reason, "supports": anchored}
+            assessment = row.get("assessment", {})
+            assessment = assessment if isinstance(assessment, dict) else {}
+            c["verification"] = {"verdict": verdict, "reason": reason, "supports": anchored,
+                                 "assessment": {"claim_type": str(assessment.get("claim_type", "unknown")),
+                                                "scope_complete": assessment.get("scope_complete") is True,
+                                                "temporal_alignment": str(assessment.get("temporal_alignment", "unknown")),
+                                                "reason": str(assessment.get("reason", "缺少范围评估"))[:500]}}
+            if verdict == "supported" and assessment.get("temporal_alignment") == "conflicting":
+                c["verification"].update(verdict="partial", reason="结论与来源的时间口径冲突")
+                continue
             if verdict != "supported":
+                continue
+            admitted, policy_reason = admission(c, anchored, by_id)
+            if not admitted:
+                c["verification"].update(verdict="insufficient", reason=policy_reason)
                 continue
             supported_ids = list(dict.fromkeys(s["evidence_id"] for s in anchored
                                                if s["relation"] in ("supports", "partial")))
-            independent = {domain_of(by_id[s["evidence_id"]][0]["source_url"])
-                           for s in anchored if s["relation"] == "supports"} - {""}
             c["evidence_ids"] = supported_ids
-            c["cross_validated"] = len(independent) >= 2
-            c["confidence"] = "high" if c["cross_validated"] else "medium" if len(supported_ids) >= 2 else "low"
+            assess_confidence(c, by_id)
+    for c in output:
+        if c["verification"]["verdict"] != "supported":
+            assess_confidence(c, by_id)
     return output
 
 
 def supported_claims(claims):
     return [c for c in claims if c.get("verification", {}).get("verdict") == "supported"]
+
+
+def locate_quote(text, quote):
+    """Whitespace normalization only; return offsets into unchanged source text."""
+    if quote in text:
+        start = text.index(quote)
+        return start, start + len(quote)
+    positions = [i for i, ch in enumerate(text) if not ch.isspace()]
+    normalized = ''.join(text[i] for i in positions)
+    needle = ''.join(ch for ch in quote if not ch.isspace())
+    if len(needle) < 4:
+        return None
+    start = normalized.find(needle)
+    if start < 0:
+        return None
+    return positions[start], positions[start + len(needle) - 1] + 1

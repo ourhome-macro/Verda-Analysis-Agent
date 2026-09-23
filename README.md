@@ -47,6 +47,9 @@
 
 更完整的架构与数据流见 [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md)。
 
+Linux 服务器 Docker Compose 部署与 Windows 上传步骤见 [docs/DOCKER_DEPLOYMENT.md](./docs/DOCKER_DEPLOYMENT.md)。
+Docker Hub 公开镜像与固定版本见 [docs/DOCKER_HUB_RELEASE.md](./docs/DOCKER_HUB_RELEASE.md)。
+
 ---
 
 ## 📂 目录结构
@@ -153,7 +156,7 @@ npm.cmd run dev
 
 | 变量 | 说明 | 必填 |
 |---|---|---|
-| `LLM_PROVIDER` | `deepseek`、`zhipu` 或 `custom`；未填写时使用 `zhipu` | 否 |
+| `LLM_PROVIDER` | `deepseek`、`zhipu` 或 `custom`；未填写时使用 `deepseek` | 否 |
 | `DEEPSEEK_API_KEY` | 使用 DeepSeek 时的 API Key | DeepSeek 必填 |
 | `ZHIPU_API_KEY` | 使用智谱时的 API Key | 智谱必填 |
 | `LLM_API_KEY` / `LLM_BASE_URL` | 自定义 OpenAI 兼容接口的 Key 和网关；也可覆盖内置 Provider | custom 必填 |
@@ -164,6 +167,10 @@ npm.cmd run dev
 | `FRONTEND_ORIGIN` | 前端地址（CORS 白名单），默认 `http://localhost:3400` | 否 |
 
 DeepSeek 示例：`LLM_PROVIDER=deepseek`，在 `backend/.env` 填 `DEEPSEEK_API_KEY`。默认使用 `deepseek-flash`，核心章节使用 `deepseek-v4-pro`；本地调试时可设置 `LLM_MODEL_CORE=deepseek-flash`。真实搜索还需填写 `BOCHA_API_KEY`。
+
+本机联调也可通过左下角「林研究员」打开「模型与搜索配置」，填写模型 Key 和博查 Key。先在未提交的 `backend/.env` 中设置 `LOCAL_SETTINGS_ENABLED=true`，并让前后端只监听本机地址。页面不会回显已保存的 Key；输入框留空表示保留原值。保存后立即应用于后续请求。云端部署始终禁用该写入接口。
+
+Docker 访客模式由 Compose 设置 `REQUIRE_CLIENT_API_KEYS=true`：服务器的 `backend/.env` 可以不填模型与博查 Key，站点仍会启动。每位访客在网页顶部提示栏自行填写 DeepSeek 与博查 Key，密钥长期保存在当前浏览器，请求调研时单独发送；服务器不会保存访客 Key。该模式需要同时更新后端与 Web 镜像，具体见 [访客 API Key 部署方案](./docs/BROWSER_API_KEYS_DEPLOYMENT.md)。
 
 验证 LLM 是否打通：
 
@@ -176,6 +183,7 @@ curl http://localhost:8010/api/llm/ping
 ## 🔒 安全说明
 
 - **所有密钥仅通过环境变量读取，绝不硬编码在代码中**（见 [backend/app/core/config.py](./backend/app/core/config.py)）。
+- 本机配置弹窗把密钥写入被忽略的 `backend/.env`；接口只返回是否已填写，不返回密钥内容。
 - `.env` 及各类密钥文件已在 [.gitignore](./.gitignore) 中屏蔽，不会被提交。
 - 本地数据库 `*.db` / WAL / SHM、运行日志 `.run-logs/` 均不入库。
 - 提交代码前请再次确认：**没有任何真实的 API Key / Token / Cookie 被提交**。
@@ -187,6 +195,9 @@ curl http://localhost:8010/api/llm/ping
 | 文档 | 内容 |
 |---|---|
 | [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) | 系统架构、模块划分、数据流、Deep Research 流水线 |
+| [来源治理与验收记录](./docs/SOURCE_GOVERNANCE_AND_EV_ACCEPTANCE.md) | 来源准入、转载聚类、最终审校、后台执行与真实案例验收 |
+| [新能源车示例报告](./doc/新能源车竞争格局分析.md) | 特斯拉、比亚迪、理想产品与定价竞争分析（附证据来源） |
+| [本地联调说明](./doc/联调验收说明.md) | 本地报告地址、截图、启动与重跑方式 |
 | [docs/AGENTS.md](./docs/AGENTS.md) | 48 专家分层、Agent 角色、消息协议、四条铁律 |
 | [docs/DEPLOYMENT.md](./docs/DEPLOYMENT.md) | 本地部署、Vercel 部署、backend/api 同步约定 |
 | [docs/系统升级实施方案.md](./docs/系统升级实施方案.md) | 完整设计与演进方案（含 AI 协作过程） |

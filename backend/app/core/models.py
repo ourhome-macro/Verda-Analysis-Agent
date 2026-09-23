@@ -25,6 +25,15 @@ class Evidence:
     domain: str = ""
     freshness_days: Optional[int] = None  # 距今天数，None=无法解析
     full_text: str = ""  # 保留抽取正文，供按问题选段与报告重载使用
+    source_tier: str = "unclassified"
+    source_policy_version: str = ""
+    canonical_url: str = ""
+    origin_url: str = ""
+    source_group: str = ""
+    content_hash: str = ""
+    provenance_reason: str = ""
+    fetch_kind: str = "snippet"
+    published_at: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -75,14 +84,8 @@ def make_claim(
     author: str,
     independent_domains: int = 0,
 ) -> Claim:
-    """按四铁律计算置信度：无证据→unverified；≥2 独立来源→high。"""
-    if not evidence_ids:
-        return Claim(claim_id, text, field_name, [], "unverified", False, author)
-    cross = independent_domains >= 2
-    if cross:
-        conf = "high"
-    elif len(evidence_ids) >= 2:
-        conf = "medium"
-    else:
-        conf = "low"
-    return Claim(claim_id, text, field_name, evidence_ids, conf, cross, author)
+    """Create an unverified proposal. Only the verifier/confidence policy may promote it.
+
+    independent_domains is retained for older callers; counts alone establish no trust.
+    """
+    return Claim(claim_id, text, field_name, list(dict.fromkeys(evidence_ids)), "unverified", False, author)

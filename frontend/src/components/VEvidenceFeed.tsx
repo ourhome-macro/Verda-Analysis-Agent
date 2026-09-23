@@ -55,7 +55,7 @@ export function VEvidenceCard({ ev, index, highlighted }: { ev: Evidence; index?
           <span className="rounded-chip bg-paper px-1.5 h-5 inline-flex items-center text-tag text-ink-3">{freshLabel}</span>
         )}
         <span className="ml-auto inline-flex items-center gap-1 text-tag text-ink-3">
-          可信度 {credPct}
+          来源评分 {credPct}
         </span>
       </div>
       <div className="mt-2 flex items-start gap-1.5">
@@ -64,6 +64,11 @@ export function VEvidenceCard({ ev, index, highlighted }: { ev: Evidence; index?
         <ExternalLink size={13} className="ml-auto shrink-0 text-ink-3 opacity-0 transition-opacity group-hover:opacity-100" />
       </div>
       <p className="mt-1.5 line-clamp-2 text-tag leading-relaxed text-ink-2">{ev.excerpt}</p>
+      {ev.source_tier && <p className="mt-2 text-tag text-ink-3">
+        来源准入：{ev.source_tier === 'official' ? '品牌官方' : ev.source_tier === 'regulatory' ? '监管原文' : '二手资料'}
+        {' · '}{ev.fetch_kind === 'rendered' ? '动态正文' : ev.fetch_kind === 'body' ? '网页正文' : '搜索摘要'}
+        {ev.source_group && <span title={ev.provenance_reason}> · 原始来源组 {ev.source_group.slice(-6)}</span>}
+      </p>}
     </motion.a>
   )
 }

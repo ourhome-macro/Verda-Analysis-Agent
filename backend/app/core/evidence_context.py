@@ -15,8 +15,8 @@ from typing import Any, List
 
 
 DIMENSIONS = {
-    "pricing_model": ("定价", "价格", "收费", "套餐", "pricing", "price", "plans", "billing", "月付", "年付"),
-    "feature_tree": ("功能", "特性", "能力", "feature", "features", "integration", "support"),
+    "pricing_model": ("定价", "价格", "售价", "指导价", "万元", "收费", "套餐", "pricing", "price", "plans", "billing", "月付", "年付"),
+    "feature_tree": ("产品", "功能", "特性", "能力", "配置", "续航", "驱动", "动力", "座椅", "辅助驾驶", "电池", "feature", "features", "integration", "support"),
     "user_persona": ("用户", "画像", "人群", "场景", "persona", "users", "teams"),
     "trend": ("趋势", "发展", "增长", "更新", "trend", "growth", "release"),
     "swot": ("swot", "优势", "劣势", "风险", "strength", "weakness", "risk"),
@@ -80,7 +80,13 @@ def select_evidence(evidences, *, query: str = "", brands=None, focus=None,
     candidates = []
     df = Counter()
     seen = set()
+    strict_primary = bool(focus) and all(field_for(f) in ("pricing_model", "feature_tree") for f in focus)
+    primary_brands = {value(e, "brand") for e in evidences if value(e, "source_tier") in ("official", "regulatory")
+                      and value(e, "fetch_kind") in ("body", "rendered")}
     for ev in evidences:
+        if strict_primary and value(ev, "brand") in primary_brands and not (
+                value(ev, "source_tier") in ("official", "regulatory") and value(ev, "fetch_kind") in ("body", "rendered")):
+            continue  # Secondary leads must not crowd out admissible first-party facts.
         eid = value(ev, "evidence_id")
         if not eid or eid in seen:
             continue
@@ -93,6 +99,10 @@ def select_evidence(evidences, *, query: str = "", brands=None, focus=None,
             tokens = terms(chunk)
             df.update(tokens)
             candidates.append({"evidence_id": eid, "brand": value(ev, "brand"),
+                               "source_tier": value(ev, "source_tier", "unclassified"),
+                               "source_group": value(ev, "source_group"),
+                               "fetch_kind": value(ev, "fetch_kind", "snippet"),
+                               "published_at": value(ev, "published_at"),
                                "title": value(ev, "title")[:200],
                                "source_url": value(ev, "source_url")[:500],
                                "start": start, "end": start + len(chunk),
@@ -111,6 +121,10 @@ def select_evidence(evidences, *, query: str = "", brands=None, focus=None,
         p["score"] += 3 * sum(bool(p["tokens"] & ts) for ts in dimension_terms)
         p["score"] += 0.15 * len(terms(p["title"]) & all_terms)
         p["score"] += min(100, max(0, float(p["credibility"] or 0))) / 1000
+        if p["source_tier"] in ("official", "regulatory") and hits:
+            p["score"] += 5
+        if any(field_for(f) == "pricing_model" for f in focus) and re.search(r"[￥¥]|\d+(?:\.\d+)?\s*(?:万元|元起)", p["text"]):
+            p["score"] += 4
     ranked = sorted(candidates, key=lambda p: (-p["score"], p["evidence_id"], p["start"]))
     selected, lines = [], []
     doc_counts = Counter()
@@ -125,7 +139,8 @@ def select_evidence(evidences, *, query: str = "", brands=None, focus=None,
         if any(s["evidence_id"] == p["evidence_id"] and
                max(s["start"], p["start"]) < min(s["end"], p["end"]) for s in selected):
             return False
-        clean = {k: p[k] for k in ("evidence_id", "brand", "title", "source_url", "start", "end", "text")}
+        clean = {k: p[k] for k in ("evidence_id", "brand", "title", "source_url", "start", "end", "text",
+                                    "source_tier", "source_group", "fetch_kind", "published_at")}
         line = json.dumps(clean, ensure_ascii=False)
         if chars + len(line) + 1 > max_chars or tokens + len(line.encode("utf-8")) + 1 > max_tokens:
             return False
