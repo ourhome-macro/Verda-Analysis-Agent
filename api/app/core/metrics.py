@@ -47,6 +47,9 @@ def compute_report_metrics(
     # 一致性（结构化程度）= 0.5×挂证据claim比 + 0.5×schema填充率
     from app.core.schemas import schema_completeness
     sc = schema_completeness(structured)
+    if structured.get("research_matrix"):
+        matrix = structured["research_matrix"]
+        sc = round(matrix["fact_covered"] / max(1, matrix["total"]), 3)
     consistency = round(0.5 * (claims_with_evidence / total_claims) + 0.5 * sc, 3)
 
     # Legacy field 'accuracy' remains an alias, NOT measured factual accuracy.
@@ -102,6 +105,7 @@ def merge_quality_into_metrics(metrics: Dict[str, Any], quality: Dict[str, Any])
     biz = metrics.setdefault("business", {})
     biz["dimension_coverage"] = quality.get("dimension_coverage_rate")
     biz["brand_coverage"] = quality.get("brand_coverage_rate")
+    biz["freshness_coverage"] = quality.get("freshness_coverage_rate")
     return metrics
 
 

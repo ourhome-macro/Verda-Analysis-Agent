@@ -10,16 +10,24 @@ import hashlib
 import re
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-POLICY_VERSION = "2026-09-23.1"
+POLICY_VERSION = "2026-09-23.2"
 REGISTRY = {
-    "tesla": {"aliases": ["特斯拉", "tesla"], "domains": ["tesla.cn", "tesla.com"],
+    "tesla": {"aliases": ["特斯拉", "tesla"], "domains": ["tesla.cn", "tesla.com"], "industry": "automotive",
               "seeds": ["https://www.tesla.cn/model3/design", "https://www.tesla.cn/modely/design"]},
-    "byd": {"aliases": ["比亚迪", "byd"], "domains": ["byd.com", "bydauto.com.cn"],
+    "byd": {"aliases": ["比亚迪", "byd"], "domains": ["byd.com", "bydauto.com.cn"], "industry": "automotive",
             "seeds": ["https://www.byd.com/cn/parameter-comparison?goodsId=10058", "https://www.byd.com/cn"]},
-    "li_auto": {"aliases": ["理想汽车", "理想", "li auto", "lixiang"],
+    "li_auto": {"aliases": ["理想汽车", "理想", "li auto", "lixiang"], "industry": "automotive",
                 "domains": ["lixiang.com", "liauto.com"], "seeds": ["https://www.lixiang.com/L6", "https://www.lixiang.com/"]},
     "github": {"aliases": ["github", "copilot"], "domains": ["github.com", "github.blog"], "seeds": []},
     "notion": {"aliases": ["notion"], "domains": ["notion.com", "notion.so"], "seeds": []},
+    "obsidian": {"aliases": ["obsidian"], "domains": ["obsidian.md"], "seeds": []},
+    "feishu": {"aliases": ["飞书", "feishu"], "domains": ["feishu.cn"], "seeds": []},
+    "yuque": {"aliases": ["语雀", "yuque"], "domains": ["yuque.com"], "seeds": [],
+              "repository_prefixes": ["https://github.com/yuque/sdk", "https://github.com/yuque/yuque-mcp-server"],
+              "dimension_seeds": {"feature_tree": ["https://www.yuque.com/about/products"],
+                                  "architecture": ["https://www.yuque.com/about/security"],
+                                  "ecosystem": ["https://github.com/yuque/sdk", "https://github.com/yuque/yuque-mcp-server"]}},
+    "microsoft": {"aliases": ["onenote", "微软onenote"], "domains": ["microsoft.com", "onenote.com"], "seeds": []},
 }
 REGULATORS = ("sec.gov", "cninfo.com.cn", "sse.com.cn", "szse.cn", "hkexnews.hk")
 MEDIA = ("reuters.com", "xinhuanet.com", "news.cn", "people.com.cn", "yicai.com", "caixin.com")
@@ -45,6 +53,18 @@ def profile(brand):
 
 def official_for(url, brand):
     host = host_of(url)
+    path = urlsplit(url).path.lower()
+    if any(url.rstrip("/") == prefix or url.startswith(prefix + "/blob/")
+           for prefix in profile(brand).get("repository_prefixes", [])):
+        return True
+    if host.startswith(("forum.", "community.", "answers.")) or "/answers/" in path:
+        return False
+    if matches_domain(host, "yuque.com"):
+        return host in ("yuque.com", "www.yuque.com", "wap.yuque.com") and (path in ("", "/", "/about", "/pricing", "/help") or path.startswith(("/yuque/", "/about/"))) and "yuque.com" in profile(brand)["domains"]
+    if matches_domain(host, "notion.so"):
+        return host in ("notion.so", "www.notion.so") and path.startswith(("/help/", "/product/", "/pricing", "/security")) and "notion.so" in profile(brand)["domains"]
+    if matches_domain(host, "feishu.cn") and host not in ("feishu.cn", "www.feishu.cn", "open.feishu.cn"):
+        return False  # Tenant-hosted user documents are not manufacturer claims.
     return bool(host) and any(matches_domain(host, d) for d in profile(brand)["domains"])
 
 
@@ -67,6 +87,9 @@ def canonical_url(url):
 def publisher_key(url):
     host = host_of(url)
     for owner, config in REGISTRY.items():
+        if any(url.rstrip("/") == prefix or url.startswith(prefix + "/") for prefix in config.get("repository_prefixes", [])):
+            return owner
+    for owner, config in REGISTRY.items():
         if any(matches_domain(host, d) for d in config["domains"]):
             return owner
     labels = host.split(".")
@@ -82,6 +105,9 @@ def classify(url, brand):
         return "regulatory"
     if any(matches_domain(host, d) for d in MEDIA):
         return "media"
+    if host.startswith(("forum.", "community.", "answers.")) or any(matches_domain(host, d) for d in
+            ("zhihu.com", "v2ex.com", "reddit.com", "weibo.com", "xiaohongshu.com", "bilibili.com", "sspai.com")):
+        return "community"
     return "secondary"
 
 
@@ -149,13 +175,17 @@ def admission(claim, supports, by_id):
     Attributed reposts and snippets cannot meet this requirement.
     """
     field = claim.get("field", "")
+    if field == "sentiment":
+        external = [p for s in supports for p in by_id.get(s["evidence_id"], [])
+                    if p.get("source_tier") in ("community", "media") and p.get("fetch_kind") in ("body", "rendered")]
+        return (True, "") if external else (False, "用户口碑必须引用可读取的社区原声或独立报道，官网宣传与搜索摘要不能替代")
     from app.core.claim_kinds import claim_kind
     if claim_kind(claim) == "observed_fact":
         external = [p for s in supports for p in by_id.get(s["evidence_id"], [])
                     if p.get("source_tier") in ("media", "regulatory") and p.get("fetch_kind") in ("body", "rendered")]
         return (True, "") if external else (False, "实际成交、实测或第三方评级需要独立记录，厂商标价或宣传不能替代")
     financial = bool(re.search(r"营收|净利|财报|revenue|net income", claim.get("text", ""), re.I))
-    if field not in ("pricing_model", "feature_tree") and not financial:
+    if field not in ("pricing_model", "feature_tree", "ecosystem", "architecture") and not financial:
         return True, ""
     if financial:
         allowed = lambda p: p.get("source_tier") == "regulatory" or (

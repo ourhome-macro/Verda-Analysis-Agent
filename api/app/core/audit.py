@@ -11,7 +11,7 @@ from typing import Any, Dict, List
 
 from app.core.fetcher import domain_of
 from app.core.models import Envelope
-from app.core.evidence_context import field_for
+from app.core.research_contract import build_contract, build_matrix
 from app.core.claim_verifier import supported_claims
 
 
@@ -24,7 +24,9 @@ class QualityReport:
     schema_completeness: float = 0.0
     dimension_coverage_rate: float = 0.0
     brand_coverage_rate: float = 0.0
+    freshness_coverage_rate: float = 0.0
     issues: List[Dict[str, Any]] = field(default_factory=list)
+    research_matrix: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -35,7 +37,9 @@ class QualityReport:
             "schema_completeness": self.schema_completeness,
             "dimension_coverage_rate": self.dimension_coverage_rate,
             "brand_coverage_rate": self.brand_coverage_rate,
+            "freshness_coverage_rate": self.freshness_coverage_rate,
             "issues": self.issues,
+            "research_matrix": self.research_matrix,
         }
 
     def summary(self) -> Dict[str, Any]:
@@ -45,117 +49,44 @@ class QualityReport:
             "independent_verification_ratio": round(self.independent_verification_ratio * 100),
             "dimension_coverage": round(self.dimension_coverage_rate * 100),
             "brand_coverage": round(self.brand_coverage_rate * 100),
+            "freshness_coverage": round(self.freshness_coverage_rate * 100),
             "schema_completeness": round(self.schema_completeness * 100),
         }
 
 
-# field -> focus 维度关键词的粗映射（用于判断某维度是否被覆盖）
-_FIELD_KEYWORDS = {
-    "pricing_model": ("定价", "价格", "收费", "套餐"),
-    "feature_tree": ("功能", "特性", "能力"),
-    "user_persona": ("用户", "画像", "人群", "场景"),
-    "trend": ("趋势", "发展", "增长"),
-    "swot": ("swot", "优势", "劣势"),
-}
-
-
-def evaluate_quality(
-    brands: List[str],
-    focus: List[str],
-    claims: List[Dict[str, Any]],
-    evidences: List[Any],
-    structured: Dict[str, Any],
-    *,
-    min_indep_domains: int = 2,
-) -> QualityReport:
+def evaluate_quality(brands, focus, claims, evidences, structured, *, min_indep_domains=2) -> QualityReport:
     qr = QualityReport()
-
-    # 1. 置信度比
-    total = len(claims) or 1
     verified = supported_claims(claims)
-    high = sum(1 for c in verified if c.get("confidence") == "high")
-    qr.confidence_ratio = round(high / total, 3)
-    qr.independent_verification_ratio = round(sum(bool(c.get("cross_validated")) for c in verified) / total, 3)
-
-    # 2. 维度覆盖：每个 focus 维度是否有语义校验通过的对应论点（包括单源 low）。
-    fields_present = {c.get("field") for c in verified}
-    for dim in focus:
-        covered = False
-        low = dim.lower()
-        for f, kws in _FIELD_KEYWORDS.items():
-            if f in fields_present and any(k in low for k in kws):
-                covered = True
-                break
-        if field_for(dim) in fields_present:
-            covered = True
-        # Unknown dimensions need an explicit field or literal topic match.
-        if not field_for(dim):
-            covered = any(c.get("field", "").lower() == low or low in c.get("text", "").lower()
-                          for c in verified)
-        qr.coverage_by_dimension[dim] = covered
-    covered_dims = sum(1 for v in qr.coverage_by_dimension.values() if v)
-    qr.dimension_coverage_rate = round(covered_dims / (len(focus) or 1), 3)
-
-    # 3. 品牌覆盖：每品牌的证据数与独立域名数
-    brand_ok = 0
-    for b in brands:
-        evs = [e for e in evidences if getattr(e, "brand", "") == b]
-        domains = {domain_of(getattr(e, "source_url", "")) for e in evs}
-        domains.discard("")
-        qr.coverage_by_brand[b] = {"evidence": len(evs), "domains": len(domains)}
-        groups = {getattr(e, "source_group", "") or domain_of(e.source_url) for e in evs} - {""}
-        primary = sum(e.source_tier in ("official", "regulatory") and e.fetch_kind in ("body", "rendered") for e in evs)
-        qr.coverage_by_brand[b].update(independent_sources=len(groups), primary_sources=primary)
-        if primary or len(groups) >= min_indep_domains:
-            brand_ok += 1
-        else:
-            qr.issues.append({
-                "issue_id": "is_" + uuid.uuid4().hex[:8],
-                "target": f"brand:{b}",
-                "severity": "high" if len(evs) == 0 else "medium",
-                "reason": f"「{b}」无一手正文且独立原始来源仅 {len(groups)} 个，建议补充采集。",
-                "raised_by": "L3-003",
-            })
-    qr.brand_coverage_rate = round(brand_ok / (len(brands) or 1), 3)
-
-    # 4. 维度缺失 issue
-    for dim, ok in qr.coverage_by_dimension.items():
-        if not ok:
-            qr.issues.append({
-                "issue_id": "is_" + uuid.uuid4().hex[:8],
-                "target": f"dimension:{dim}",
-                "severity": "medium",
-                "reason": f"维度「{dim}」缺少有效论点支撑，建议重新分析。",
-                "raised_by": "L3-003",
-            })
-
-    # 5. Schema 完整度
-    from app.core.schemas import schema_completeness
-    qr.schema_completeness = schema_completeness(structured)
-    if qr.schema_completeness < 0.34:
-        qr.issues.append({
-            "issue_id": "is_" + uuid.uuid4().hex[:8],
-            "target": "schema",
-            "severity": "low",
-            "reason": "结构化知识（功能树/定价/画像）填充不足，建议重新分析补全。",
-            "raised_by": "L3-003",
-        })
-
-    if not claims:
-        qr.issues.append({"issue_id": "no_claims", "target": "claims", "severity": "high",
-                          "reason": "没有生成可验证论点，需重新分析", "raised_by": "L3-003"})
-    for c in claims:
-        verification = c.get("verification", {})
-        if verification.get("verdict") == "supported":
-            continue
-        refs = set(c.get("evidence_ids", []))
-        affected = sorted({getattr(e, "brand", "") for e in evidences
-                           if getattr(e, "evidence_id", "") in refs} - {""}) or list(brands)
-        qr.issues.append({"issue_id": "claim_" + c["claim_id"], "target": "claim:" + c["claim_id"],
-                          "severity": "high", "reason": verification.get("reason", "论点未经证据校验"),
-                          "verdict": verification.get("verdict", "insufficient"),
-                          "brands": affected, "query": c.get("text", "")[:160],
-                          "field": c.get("field", ""), "raised_by": "L3-003"})
+    qr.confidence_ratio = round(sum(c.get("confidence") == "high" for c in verified) / max(1, len(claims)), 3)
+    qr.independent_verification_ratio = round(sum(bool(c.get("cross_validated")) for c in verified) / max(1, len(claims)), 3)
+    contract = structured.get("research_matrix", {}).get("contract") or build_contract(brands, focus)
+    matrix = build_matrix(contract, claims, evidences)
+    qr.research_matrix = matrix
+    for dim in contract["dimensions"]:
+        cells = [c for c in matrix["cells"] if c["dimension"] == dim["key"]]
+        qr.coverage_by_dimension[dim["label"]] = bool(cells) and all(c["claim_ids"] for c in cells)
+    for brand in brands:
+        evs = [e for e in evidences if e.brand == brand]
+        cells = [c for c in matrix["cells"] if c["brand"] == brand]
+        qr.coverage_by_brand[brand] = {
+            "evidence": len(evs), "domains": len({domain_of(e.source_url) for e in evs}),
+            "independent_sources": len({e.source_group or domain_of(e.source_url) for e in evs}),
+            "primary_sources": sum(e.source_tier in ("official", "regulatory") and e.fetch_kind in ("body", "rendered") for e in evs),
+            "verified_claims": sum(len(c["claim_ids"]) for c in cells),
+            "covered_cells": sum(bool(c["claim_ids"]) for c in cells), "required_cells": len(cells)}
+    qr.dimension_coverage_rate = round(sum(qr.coverage_by_dimension.values()) / max(1, len(contract["dimensions"])), 3)
+    qr.brand_coverage_rate = round(sum(v["covered_cells"] == v["required_cells"] and v["required_cells"] > 0
+                                         for v in qr.coverage_by_brand.values()) / max(1, len(brands)), 3)
+    # Schema completeness now means required cells, not unrelated pricing/persona schemas.
+    qr.schema_completeness = round(matrix["fact_covered"] / max(1, matrix["total"]), 3)
+    qr.freshness_coverage_rate = round(matrix["covered"] / max(1, matrix["total"]), 3)
+    for cell in matrix["cells"]:
+        if cell["status"] != "covered":
+            qr.issues.append({"issue_id": cell["cell_id"], "target": "cell:" + cell["cell_id"],
+                              "severity": "high" if cell["status"] == "missing" else "medium",
+                              "reason": f"{cell['brand']} × {cell['label']}：{cell['gap']}",
+                              "brand": cell["brand"], "dimension": cell["dimension"],
+                              "cell_id": cell["cell_id"], "raised_by": "L3-003"})
     return qr
 
 
@@ -176,12 +107,12 @@ def llm_quality_review(
     from app.core.llm import chat_json
 
     claim_lines = "\n".join(
-        f"- [{c.get('confidence','?')}|{c.get('field','')}] {c.get('text','')}"
-        for c in claims[:24]
+        f"- [{c.get('brand','')}|{c.get('confidence','?')}|{c.get('field','')}|{c.get('verification',{}).get('verdict')}|{c.get('temporal',{}).get('label','unknown')}] {c.get('text','')}"
+        for c in claims
     ) or "（暂无论点）"
     sc_dims = "、".join(f"{k}:{'已覆盖' if v else '缺失'}"
                        for k, v in qr.coverage_by_dimension.items()) or "无"
-    brand_cov = "、".join(f"{b}({v.get('domains',0)}域/{v.get('evidence',0)}证据)"
+    brand_cov = "、".join(f"{b}({v.get('covered_cells',0)}/{v.get('required_cells',0)}格，{v.get('verified_claims',0)}条核验事实)"
                          for b, v in qr.coverage_by_brand.items()) or "无"
     fallback = {
         "verdict": "pass" if not qr.issues else "rework",
@@ -205,19 +136,25 @@ def llm_quality_review(
                     "此阶段是原子事实供给，不要求提前写出战略判断。官方一手正文足以支撑该品牌价格/配置事实，"
                     "不要仅因单源导致低置信或缺少跨域引用就判返工；检查是否覆盖每个品牌及用户要求维度。"
                     "事实可信程度与独立验证程度是不同指标：官方标价可以高可信且只有一个原始来源，不得混为事实准确率。"
+                    "严格区分事实覆盖与时效覆盖：background_only格已有核验事实，只缺窗口内日期，不能说该品牌或维度没有事实。"
                     "像券商内核/主编终审一样，逐维度打分（0-100 整数，要有真实差异、不要清一色整十），"
                     "指出具体问题，并给出可执行的改进建议。最后给整体结论 pass（达标）或 rework（需返工）。"
                     '只输出 JSON：{"verdict":"pass|rework",'
                     '"scores":{"证据充分性":int,"维度完整性":int,"结论置信度":int,"结构化完整度":int,"交叉验证":int},'
                     '"review":"一段总体评审意见（点明亮点与短板）",'
                     '"issues":["具体问题1","具体问题2"],'
+                    '"rework_cells":[{"brand":"指定品牌","dimension":"契约中的维度key","reason":"具体补采目标"}],'
                     '"suggestions":["可执行改进建议1","改进建议2"]}。只输出 JSON。'
                 )},
                 {"role": "user", "content": (
                     f"调研主题：{query}\n竞品：{'、'.join(brands)}\n重点维度：{'、'.join(focus)}\n"
+                    f"研究契约与截止日期：{qr.research_matrix.get('contract', {})}\n"
+                    "需要返工时必须输出rework_cells定位到品牌与维度。不得扩大用户维度；"
+                    "年份款号不等于发布日期；当前截止日期之前的发布不是未来信息。"
+                    "完整的来源声明与可跨品牌直接比较不是一回事；不应因单一官方来源本身要求返工。\n"
                     f"规则侧指标 → 维度覆盖：{sc_dims}；品牌证据覆盖：{brand_cov}；"
                     f"高置信占比：{round(qr.confidence_ratio*100)}%；结构化完整度：{round(qr.schema_completeness*100)}%\n"
-                    f"已提炼论点：\n{claim_lines}"
+                    f"矩阵缺口：{[i['reason'] for i in qr.issues]}\n已提炼论点：\n{claim_lines}"
                 )},
             ],
             max_tokens=2000, temperature=0.3, model=model,
@@ -231,6 +168,7 @@ def llm_quality_review(
                 "review": str(data.get("review") or fallback["review"]),
                 "issues": [str(x) for x in (data.get("issues") or []) if str(x).strip()][:8],
                 "suggestions": [str(x) for x in (data.get("suggestions") or []) if str(x).strip()][:8],
+                "rework_cells": data.get("rework_cells", []) if isinstance(data.get("rework_cells"), list) else [],
             }
     except Exception:
         pass
@@ -244,37 +182,20 @@ def _clamp_score(v) -> int:
         return 0
 
 
-def decide_rework(qr: QualityReport) -> List[Envelope]:
-    """根据质量报告决定返工动作，产出结构化 Envelope 消息。"""
-    envelopes: List[Envelope] = []
-
-    # 证据不足 → 打回 collect 补采
-    collect_targets = [iss for iss in qr.issues if iss["target"].startswith(("brand:", "claim:"))]
-    if collect_targets:
-        brands_to_recollect = list(dict.fromkeys(
-            b for iss in collect_targets for b in
-            ([iss["target"].split(":", 1)[1]] if iss["target"].startswith("brand:") else iss.get("brands", []))))
-        envelopes.append(Envelope(
-            msg_id="env_" + uuid.uuid4().hex[:8],
-            sender="L3-003",
-            receiver="collect",
-            task_type="REWORK",
-            payload={"brands": brands_to_recollect, "reason": "证据不足，补充采集",
-                     "queries": list(dict.fromkeys(iss["query"] for iss in collect_targets if iss.get("query")))[:3]},
-            issues=collect_targets,
-        ))
-
-    # 维度缺失 / schema 不足 → 打回 analyze 重分析
-    analyze_targets = [iss for iss in qr.issues
-                       if iss["target"].startswith("dimension:") or iss["target"] in ("schema", "claims")]
-    if analyze_targets:
-        envelopes.append(Envelope(
-            msg_id="env_" + uuid.uuid4().hex[:8],
-            sender="L3-003",
-            receiver="analyze",
-            task_type="REWORK",
-            payload={"reason": "维度/结构覆盖不足，重新分析补全"},
-            issues=analyze_targets,
-        ))
-
-    return envelopes
+def decide_rework(qr: QualityReport, review=None) -> List[Envelope]:
+    """One bounded envelope explicitly names missing brand/dimension cells."""
+    cells = [{k: issue[k] for k in ("cell_id", "brand", "dimension")}
+             for issue in qr.issues if issue.get("target", "").startswith("cell:")]
+    allowed = {(c["brand"], c["dimension"]): c for c in qr.research_matrix.get("cells", [])}
+    for item in (review or {}).get("rework_cells", []):
+        if not isinstance(item, dict):
+            continue
+        cell = allowed.get((item.get("brand"), item.get("dimension")))
+        if cell and not any(c["cell_id"] == cell["cell_id"] for c in cells):
+            cells.append({**{k: cell[k] for k in ("cell_id", "brand", "dimension")},
+                          "reason": str(item.get("reason", ""))[:400]})
+    if not cells:
+        return []
+    return [Envelope(msg_id="env_" + uuid.uuid4().hex[:8], sender="L3-003", receiver="collect",
+                     task_type="REWORK", payload={"cells": cells, "reason": "按品牌×维度缺口定向补采并重新核验"},
+                     issues=qr.issues)]

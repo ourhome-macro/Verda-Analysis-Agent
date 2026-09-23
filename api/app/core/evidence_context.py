@@ -14,20 +14,9 @@ from dataclasses import dataclass
 from typing import Any, List
 
 
-DIMENSIONS = {
-    "pricing_model": ("定价", "价格", "售价", "指导价", "万元", "收费", "套餐", "pricing", "price", "plans", "billing", "月付", "年付"),
-    "feature_tree": ("产品", "功能", "特性", "能力", "配置", "续航", "驱动", "动力", "座椅", "辅助驾驶", "电池", "feature", "features", "integration", "support"),
-    "user_persona": ("用户", "画像", "人群", "场景", "persona", "users", "teams"),
-    "trend": ("趋势", "发展", "增长", "更新", "trend", "growth", "release"),
-    "swot": ("swot", "优势", "劣势", "风险", "strength", "weakness", "risk"),
-    "sentiment": ("口碑", "舆情", "评价", "review", "reviews", "sentiment"),
-}
+from app.core.research_contract import DIMENSIONS as SPECS, field_for
 
-
-def field_for(dimension: str) -> str:
-    low = dimension.lower()
-    return next((field for field, words in DIMENSIONS.items()
-                 if field == low or any(w in low for w in words)), "")
+DIMENSIONS = {key: spec["terms"] for key, spec in SPECS.items()}
 
 
 def terms(text: str) -> set[str]:
@@ -67,7 +56,7 @@ class EvidenceContext:
 
 def select_evidence(evidences, *, query: str = "", brands=None, focus=None,
                     limit: int = 28, max_chars: int = 18000,
-                    max_tokens: int = 24000) -> EvidenceContext:
+                    max_tokens: int = 24000, prefer_ids=None) -> EvidenceContext:
     """Fair selection across brand/dimension groups, then relevance fill.
 
     Every candidate (including newly appended evidence) is rescored on each call.
@@ -75,12 +64,13 @@ def select_evidence(evidences, *, query: str = "", brands=None, focus=None,
     """
     brands = list(dict.fromkeys(brands or []))
     focus = list(dict.fromkeys(focus or []))
+    prefer_ids = set(prefer_ids or [])
     if limit <= 0 or max_chars <= 0 or max_tokens <= 0:
         return EvidenceContext([], "")
     candidates = []
     df = Counter()
     seen = set()
-    strict_primary = bool(focus) and all(field_for(f) in ("pricing_model", "feature_tree") for f in focus)
+    strict_primary = bool(focus) and all(field_for(f) in ("pricing_model", "feature_tree", "ecosystem", "architecture") for f in focus)
     primary_brands = {value(e, "brand") for e in evidences if value(e, "source_tier") in ("official", "regulatory")
                       and value(e, "fetch_kind") in ("body", "rendered")}
     for ev in evidences:
@@ -103,6 +93,7 @@ def select_evidence(evidences, *, query: str = "", brands=None, focus=None,
                                "source_group": value(ev, "source_group"),
                                "fetch_kind": value(ev, "fetch_kind", "snippet"),
                                "published_at": value(ev, "published_at"),
+                               "captured_at": value(ev, "captured_at"),
                                "title": value(ev, "title")[:200],
                                "source_url": value(ev, "source_url")[:500],
                                "start": start, "end": start + len(chunk),
@@ -140,7 +131,7 @@ def select_evidence(evidences, *, query: str = "", brands=None, focus=None,
                max(s["start"], p["start"]) < min(s["end"], p["end"]) for s in selected):
             return False
         clean = {k: p[k] for k in ("evidence_id", "brand", "title", "source_url", "start", "end", "text",
-                                    "source_tier", "source_group", "fetch_kind", "published_at")}
+                                    "source_tier", "source_group", "fetch_kind", "published_at", "captured_at")}
         line = json.dumps(clean, ensure_ascii=False)
         if chars + len(line) + 1 > max_chars or tokens + len(line.encode("utf-8")) + 1 > max_tokens:
             return False
@@ -152,6 +143,16 @@ def select_evidence(evidences, *, query: str = "", brands=None, focus=None,
         tokens += len(line.encode("utf-8")) + 1
         return True
 
+    # Reserve one relevant recent passage per cell before older keyword-rich pages.
+    for brand in (brands or [""]):
+        for dim_terms in (dimension_terms or [query_terms]):
+            for p in ranked:
+                if p["evidence_id"] not in prefer_ids or (brand and p["brand"] != brand):
+                    continue
+                if dim_terms and not p["tokens"] & dim_terms:
+                    continue
+                if add(p):
+                    break
     # Dimension-first round robin ensures later brands compete before repeats.
     for dim_terms in (dimension_terms or [query_terms]):
         for brand in (brands or [""]):

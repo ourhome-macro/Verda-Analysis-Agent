@@ -42,6 +42,7 @@ def fetch_page(url: str, *, fallback_snippet: str = "") -> Dict[str, Any]:
         "fetch_kind": "snippet",
         "origin_url": "",
         "product_links": [],
+        "published_at": "",
     }
     try:
         with httpx.Client(
@@ -73,6 +74,10 @@ def fetch_page(url: str, *, fallback_snippet: str = "") -> Dict[str, Any]:
                 pass
 
         text = _extract_text(html)
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html, "html.parser")
+        published = soup.find("meta", attrs={"property": "article:published_time"}) or soup.find("meta", attrs={"itemprop": "datePublished"})
+        result["published_at"] = str(published.get("content", "")) if published else ""
         origin_url = _original_link(html, url)
         product_links = []
         fetch_kind = "body"

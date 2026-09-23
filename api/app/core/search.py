@@ -16,6 +16,7 @@ import httpx
 from app.core.source_policy import host_of, matches_domain, canonical_url
 
 from app.core.config import get_settings
+from app.core import trace
 
 # 博查异常码 → 人话提示
 _BOCHA_ERR = {
@@ -182,6 +183,8 @@ def multi_search(
                 seen.add(key)
                 r["query"] = q
                 out.append(r)
-        except Exception:
+        except Exception as exc:
+            trace.record_span(model="bocha", messages=[{"role": "user", "content": q}],
+                              response=type(exc).__name__, decision="搜索请求失败，未当作无结果；" + type(exc).__name__)
             continue
     return out

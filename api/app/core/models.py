@@ -34,6 +34,9 @@ class Evidence:
     provenance_reason: str = ""
     fetch_kind: str = "snippet"
     published_at: str = ""
+    research_dimensions: List[str] = field(default_factory=list)
+    search_freshness: str = ""
+    research_version: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

@@ -105,9 +105,14 @@ export interface Evidence {
   source_group?: string
   fetch_kind?: string
   provenance_reason?: string
+  published_at?: string
 }
 
 export interface Claim {
+  brand?: string
+  dimension?: string
+  cell_id?: string
+  temporal?: {label: string; published_at: string[]; as_of: string; note: string}
   claim_id: string
   text: string
   field: string
@@ -204,6 +209,11 @@ export interface SentimentResult {
 }
 
 export interface Report {
+  research_matrix?: {
+    contract: {brands: string[]; dimensions: {key: string; label: string}[]; as_of: string; since: string; window_days: number | null}
+    total: number; covered: number; fact_covered: number; recent_claim_ids: string[]
+    cells: {cell_id: string; brand: string; dimension: string; label: string; status: string; claim_ids: string[]; recent_claim_ids: string[]; high_count: number; gap: string}[]
+  }
   id: string
   title: string
   subtitle: string

@@ -6,6 +6,7 @@ interface QualityData {
   dimension_coverage_rate?: number
   brand_coverage_rate?: number
   schema_completeness?: number
+  freshness_coverage_rate?: number
 }
 
 const METRICS: { key: keyof QualityData; label: string }[] = [
@@ -13,6 +14,7 @@ const METRICS: { key: keyof QualityData; label: string }[] = [
   { key: 'independent_verification_ratio', label: '独立验证占比' },
   { key: 'dimension_coverage_rate', label: '维度覆盖' },
   { key: 'brand_coverage_rate', label: '品牌覆盖' },
+  { key: 'freshness_coverage_rate', label: '时效覆盖' },
   { key: 'schema_completeness', label: '结构完整' },
 ]
 
@@ -28,7 +30,7 @@ export function VQualityGate({ before, after }: { before?: QualityData; after?: 
         <RotateCcw size={14} /> 质检反馈闭环 · 返工前后对比
       </div>
       <div className="mt-3 grid grid-cols-2 gap-3 md:grid-cols-4">
-        {METRICS.map((m) => {
+        {METRICS.filter(m => before[m.key] !== undefined || after[m.key] !== undefined).map((m) => {
           const b = Math.round((before[m.key] ?? 0) * 100)
           const a = Math.round((after[m.key] ?? 0) * 100)
           const up = a > b

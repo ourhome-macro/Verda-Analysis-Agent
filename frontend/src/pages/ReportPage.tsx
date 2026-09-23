@@ -1,4 +1,5 @@
 import { useEffect, useState, useRef } from 'react'
+import VResearchMatrix from '../components/VResearchMatrix'
 import { useNavigate, useParams } from 'react-router-dom'
 import { motion } from 'framer-motion'
 import {
@@ -401,6 +402,7 @@ export default function ReportPage() {
             </div>
           )}
           <VAuditReview review={r.audit_review} />
+          <VResearchMatrix report={r} />
           <VQualityGate before={r.quality_before} after={r.quality_after} />
           {r.sections.map((sec, idx) => (
             <section key={sec.id} id={`sec-${sec.id}`} data-section-id={sec.id} className="mb-12 scroll-mt-6">
@@ -488,7 +490,7 @@ export default function ReportPage() {
               {sec.data_grid && <VDataGrid grid={sec.data_grid} title={`${sec.title} · 数据空间`} />}
 
               {/* 舆情专章 */}
-              {sec.id === 'sentiment' && r.sentiment && (
+              {sec.id === 'sentiment' && r.sentiment?.overall && r.sentiment.sample_size > 0 && (
                 <div className="mt-5">
                   <VSentimentPanel sentiment={r.sentiment} />
                 </div>

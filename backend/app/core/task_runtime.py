@@ -75,7 +75,7 @@ def collection_checkpoint(task_id):
         data = json.loads(row["data"])
         try:
             ev = Evidence(**{k: v for k, v in data.items() if k in keys})
-            pool[(ev.brand, ev.source_url)] = ev
+            pool[(ev.brand, ev.source_url, tuple(ev.research_dimensions))] = ev
         except (TypeError, ValueError):
             continue
     return list(pool.values())

@@ -34,6 +34,8 @@ export function VSentimentPanel({
   sentiment: SentimentResult
   charts?: ChartSpec[]
 }) {
+  // Final audit intentionally omits unverified aggregate sentiment statistics.
+  if (!sentiment?.overall || !sentiment.sample_size) return null
   const { overall, by_platform, camps, voices, highlights, sample_size } = sentiment
   const total = overall.pos + overall.neu + overall.neg || 1
   return (
