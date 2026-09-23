@@ -1,15 +1,11 @@
-"""Final report gate: published prose is checked against admitted verified claims.
-
-Unproven charts/structured numeric objects are replaced by a deterministic claim
-ledger. Rejected prose is removed; when a section loses its prose, the admitted
-claim text itself is used with exact citations and marked as an extractive repair.
-"""
+"""Final report gate for prose and source-backed visual artifacts."""
 from __future__ import annotations
 
 import json
 import re
 
 from app.core.claim_verifier import _numbers, supported_claims
+from app.core.audited_artifacts import apply_audited_artifacts
 from app.core.llm import chat_json
 
 
@@ -113,14 +109,11 @@ def finalize_report(report, *, model, reviewer=None):
             section["paragraphs"] = ["本维度尚未取得满足来源政策和支持性核验的结论，暂不作事实判断。"]
         section["verified_claim_ids"] = list(dict.fromkeys(section.get("verified_claim_ids", [])))
         section["source_evidence_ids"] = list(dict.fromkeys(eid for c in claims for eid in c["evidence_ids"]))
-    report["charts"] = []
-    report["structured"] = {}
-    # The exploratory sentiment panel has not passed this fact gate; don't publish it as audited data.
-    report["sentiment"] = {}
+    apply_audited_artifacts(report)
     report["final_audit"] = {"status": "passed" if verified else "needs_review", "checked_units": len(checks),
                              "accepted_units": sum(c["supported"] for c in checks), "repairs": edits,
                              "checks": checks, "verified_claim_count": len(verified),
-                             "scope": "正文、核心判断、亮点与逐条Claim台账；未核验数值图表不发布"}
+                             "scope": "正文、核心判断、亮点、逐条Claim台账及已核验论点衍生图表；未经核验的评分和舆情比例不发布"}
     matrix = report.get("research_matrix")
     if matrix:
         report["final_audit"]["coverage_status"] = "passed" if matrix["covered"] == matrix["total"] else "needs_review"

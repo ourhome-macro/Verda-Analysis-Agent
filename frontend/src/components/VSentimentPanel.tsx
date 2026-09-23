@@ -34,7 +34,25 @@ export function VSentimentPanel({
   sentiment: SentimentResult
   charts?: ChartSpec[]
 }) {
-  // Final audit intentionally omits unverified aggregate sentiment statistics.
+  if (sentiment?.verified_voices?.length) {
+    return (
+      <div className="rounded-card border border-line bg-card p-4">
+        <div className="mb-1 text-aux font-semibold text-ink">已核验社区观点</div>
+        <p className="mb-3 text-tag text-ink-3">逐条来源可查；不将个别观点推算为全网比例。</p>
+        <div className="space-y-3">
+          {sentiment.verified_voices.map((voice) => (
+            <div key={voice.claim_id} className="border-b border-line/60 pb-3 last:border-0 last:pb-0">
+              <p className="text-aux text-ink-2">{voice.text}</p>
+              <a href={voice.url} target="_blank" rel="noreferrer" className="mt-1 inline-block text-tag text-primary-deep hover:underline">
+                查看原始来源 →
+              </a>
+            </div>
+          ))}
+        </div>
+      </div>
+    )
+  }
+  // Legacy aggregate data remains hidden when the final audit has no verified sample ledger.
   if (!sentiment?.overall || !sentiment.sample_size) return null
   const { overall, by_platform, camps, voices, highlights, sample_size } = sentiment
   const total = overall.pos + overall.neu + overall.neg || 1

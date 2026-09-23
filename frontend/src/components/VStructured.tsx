@@ -2,6 +2,34 @@ import { Check, Minus, X } from 'lucide-react'
 
 type Row = Record<string, unknown>
 
+/** Fact rows are derived from claims admitted by the final audit. */
+export function VVerifiedFacts({ data, onCite }: { data: Row[]; onCite?: (ids: string[]) => void }) {
+  if (!data?.length) return null
+  return (
+    <div className="mt-4 rounded-card border border-line bg-card p-4">
+      <div className="mb-3 text-aux font-semibold text-ink">已核验结构化事实</div>
+      <div className="space-y-3">
+        {data.map((fact, index) => (
+          <div key={String(fact.claim_id ?? index)} className="border-b border-line/60 pb-3 last:border-0 last:pb-0">
+            <div className="mb-1 text-tag text-primary-deep">
+              {String(fact.brand ?? '')} · {String(fact.dimension ?? '')}
+            </div>
+            <p className="text-aux leading-relaxed text-ink-2">{String(fact.text ?? '')}</p>
+            {Array.isArray(fact.evidence_ids) && fact.evidence_ids.length > 0 && (
+              <button
+                className="mt-1 text-tag text-primary-deep hover:underline"
+                onClick={() => onCite?.(fact.evidence_ids as string[])}
+              >
+                查看来源 →
+              </button>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
 /** 功能树矩阵：展示各品牌的功能模块与支持程度。 */
 export function VFeatureMatrix({ data }: { data: Row[] }) {
   if (!data?.length) return null

@@ -169,7 +169,7 @@ export interface DataGrid {
 
 /* 结构化竞品知识 */
 export interface StructuredBlock {
-  type: 'feature_tree' | 'pricing_model' | 'user_persona'
+  type: 'feature_tree' | 'pricing_model' | 'user_persona' | 'verified_facts'
   data: Record<string, unknown>[]
 }
 
@@ -198,6 +198,7 @@ export interface ReportMetrics {
 }
 
 export interface SentimentResult {
+  verified_voices?: { claim_id: string; text: string; url: string; evidence_ids: string[] }[]
   overall: { pos: number; neu: number; neg: number }
   overall_count?: { pos: number; neu: number; neg: number }
   by_platform: Record<string, { pos: number; neu: number; neg: number }>

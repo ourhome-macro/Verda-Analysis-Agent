@@ -40,7 +40,7 @@ import { VQualityGate } from '../components/VQualityGate'
 import { VAuditReview } from '../components/VAuditReview'
 import { VDecisionReplay } from '../components/VDecisionReplay'
 import { VDataGrid } from '../components/VDataGrid'
-import { VFeatureMatrix, VPricingTable, VPersonaCards } from '../components/VStructured'
+import { VFeatureMatrix, VPricingTable, VPersonaCards, VVerifiedFacts } from '../components/VStructured'
 import { refineSection, submitFeedback } from '../lib/api'
 import { VSkeleton, VCountUp } from '../components/ui'
 
@@ -485,12 +485,14 @@ export default function ReportPage() {
               {sec.structured?.type === 'feature_tree' && <VFeatureMatrix data={sec.structured.data} />}
               {sec.structured?.type === 'pricing_model' && <VPricingTable data={sec.structured.data} />}
               {sec.structured?.type === 'user_persona' && <VPersonaCards data={sec.structured.data} />}
+              {sec.structured?.type === 'verified_facts' && <VVerifiedFacts data={sec.structured.data} onCite={jumpToEvidence} />}
 
               {/* 数据空间（CSV 表格）*/}
               {sec.data_grid && <VDataGrid grid={sec.data_grid} title={`${sec.title} · 数据空间`} />}
 
               {/* 舆情专章 */}
-              {sec.id === 'sentiment' && r.sentiment?.overall && r.sentiment.sample_size > 0 && (
+              {sec.id === 'sentiment' && r.sentiment &&
+                (Boolean(r.sentiment.verified_voices?.length) || (Boolean(r.sentiment.overall) && r.sentiment.sample_size > 0)) && (
                 <div className="mt-5">
                   <VSentimentPanel sentiment={r.sentiment} />
                 </div>

@@ -316,7 +316,13 @@ def get_report(report_id: str) -> Optional[Dict[str, Any]]:
     row = c.execute("SELECT data FROM reports WHERE report_id=?", (report_id,)).fetchone()
     if not row:
         return None
-    return json.loads(row["data"])
+    report = json.loads(row["data"])
+    if report.get("final_audit") and not report.get("audited_artifact_version"):
+        # Older audited reports discarded their charts. Their verified claims and
+        # evidence are still stored, so the safe views can be rebuilt on read.
+        from app.core.audited_artifacts import apply_audited_artifacts
+        apply_audited_artifacts(report)
+    return report
 
 
 def list_reports() -> List[Dict[str, Any]]:
