@@ -11,7 +11,7 @@ import json
 import time
 from contextlib import suppress
 
-from app.core import db, trace, llm
+from app.core import db, trace, llm, performance
 from app.core.config import use_request_settings
 
 _workers = {}
@@ -137,8 +137,10 @@ async def _run(task_id, attempt, visitor_id, settings, pipeline, sub_id):
     beat = asyncio.create_task(heartbeat())
     status = "failed"
     try:
-        with db.use_visitor(visitor_id), use_request_settings(settings), llm.use_request_client():
+        with db.use_visitor(visitor_id), use_request_settings(settings), llm.use_request_client(), performance.use_task(task_id):
             async for event in pipeline(task_id, sub_id=sub_id):
+                if event["type"] == "node_update":
+                    performance.on_node_update(task_id, event["data"])
                 append_event(task_id, attempt, event)
                 if event["type"] == "done":
                     status = "done"
@@ -154,6 +156,11 @@ async def _run(task_id, attempt, visitor_id, settings, pipeline, sub_id):
         beat.cancel()
         with suppress(asyncio.CancelledError):
             await beat
+        try:
+            db.save_attempt_performance(task_id, attempt, status,
+                                        performance.snapshot(task_id))
+        except Exception:
+            pass  # Metrics must never prevent task state cleanup.
         with db._LOCK:
             c = db._connect()
             c.execute("UPDATE research_runs SET status=?,updated_at=? WHERE task_id=? AND attempt=?",
@@ -162,6 +169,7 @@ async def _run(task_id, attempt, visitor_id, settings, pipeline, sub_id):
                 c.execute("UPDATE tasks SET status=? WHERE task_id=?", (status, task_id))
             c.commit()
         trace.cleanup(task_id)
+        performance.cleanup(task_id)
         _workers.pop(task_id, None)
 
 

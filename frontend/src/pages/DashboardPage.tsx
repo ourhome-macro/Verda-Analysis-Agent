@@ -23,7 +23,7 @@ function fmtSaved(min: number): { value: number; unit: string } {
 
 const SOURCE_LABEL: Record<string, string> = {
   official: '官网', news: '新闻媒体', douyin: '抖音', xiaohongshu: '小红书',
-  bilibili: 'B站', weibo: '微博', zhihu: '知乎', review: '评测', financial_report: '财报', web: '网页',
+  bilibili: 'B站', weibo: '微博', x: 'X', zhihu: '知乎', review: '评测', financial_report: '财报', web: '网页',
 }
 function sourceLabel(t: string) {
   return SOURCE_LABEL[t] ?? t
@@ -34,7 +34,7 @@ const SOURCE_CATEGORY: Record<string, '权威一手' | '媒体报道' | '社媒�
   official: '权威一手', financial_report: '权威一手',
   news: '媒体报道', web: '媒体报道', review: '媒体报道',
   douyin: '社媒口碑', xiaohongshu: '社媒口碑', bilibili: '社媒口碑',
-  weibo: '社媒口碑', zhihu: '社媒口碑',
+  weibo: '社媒口碑', x: '社媒口碑', zhihu: '社媒口碑',
 }
 const CATEGORY_COLOR: Record<string, string> = {
   权威一手: 'bg-primary', 媒体报道: 'bg-info', 社媒口碑: 'bg-sun',

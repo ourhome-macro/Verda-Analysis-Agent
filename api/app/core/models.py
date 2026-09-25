@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional
 class Evidence:
     evidence_id: str
     source_url: str
-    source_type: str  # official|news|douyin|xiaohongshu|bilibili|weibo|zhihu|review|financial_report
+    source_type: str  # official|news|douyin|xiaohongshu|bilibili|weibo|x|zhihu|review|financial_report
     title: str
     excerpt: str
     captured_at: str
@@ -37,6 +37,7 @@ class Evidence:
     research_dimensions: List[str] = field(default_factory=list)
     search_freshness: str = ""
     research_version: str = ""
+    search_provider: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

@@ -69,10 +69,24 @@ class Settings(BaseSettings):
     # 下耗时较长，180s 给足余量；max_retries 设 1，避免超时后再叠加 2 次重试（最坏 3×timeout）。
     llm_timeout: float = 180.0
     llm_max_retries: int = 1
+    llm_max_input_bytes: int = 180000
 
     # 搜索 API（博查 Bocha Web Search：https://open.bocha.cn 获取 key）
     bocha_api_key: str = ""
     bocha_base_url: str = "https://api.bocha.cn/v1"
+    anysearch_api_key: str = ""
+    anysearch_base_url: str = "https://api.anysearch.com/v1"
+    grok_search_api_key: str = ""
+    grok_search_base_url: str = "https://api.x.ai/v1"
+    grok_search_model: str = "grok-4.7"
+    grok_search_mode: str = "native"  # native=服务端 web_search；planner=模型规划查询词+AnySearch 取证
+    search_providers: str = "bocha"
+    bocha_requests_per_second: float = 2.0
+    anysearch_requests_per_second: float = 2.0
+    grok_requests_per_second: float = 1.0
+    search_max_in_flight: int = 2
+    search_max_queue_wait: float = 60.0
+    collect_brand_concurrency: int = 2
     # 单次搜索超时（秒）
     search_timeout: float = 30.0
     # 兼容旧字段（已弃用，不再使用）

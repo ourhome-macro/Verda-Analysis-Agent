@@ -106,7 +106,7 @@ def classify(url, brand):
     if any(matches_domain(host, d) for d in MEDIA):
         return "media"
     if host.startswith(("forum.", "community.", "answers.")) or any(matches_domain(host, d) for d in
-            ("zhihu.com", "v2ex.com", "reddit.com", "weibo.com", "xiaohongshu.com", "bilibili.com", "sspai.com")):
+            ("zhihu.com", "v2ex.com", "reddit.com", "weibo.com", "xiaohongshu.com", "bilibili.com", "sspai.com", "x.com", "twitter.com")):
         return "community"
     return "secondary"
 

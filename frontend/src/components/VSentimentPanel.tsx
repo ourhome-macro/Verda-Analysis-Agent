@@ -8,6 +8,7 @@ const PLATFORM_LABEL: Record<string, string> = {
   xiaohongshu: '小红书',
   bilibili: 'B站',
   weibo: '微博',
+  x: 'X',
   zhihu: '知乎',
 }
 
@@ -17,6 +18,7 @@ const PLATFORM_STYLE: Record<string, { dot: string; chip: string }> = {
   xiaohongshu: { dot: 'bg-[#FF2442]', chip: 'bg-[#FF2442]/8 text-[#FF2442]' },
   bilibili: { dot: 'bg-[#00AEEC]', chip: 'bg-[#00AEEC]/10 text-[#0090c5]' },
   weibo: { dot: 'bg-[#E6162D]', chip: 'bg-[#E6162D]/8 text-[#E6162D]' },
+  x: { dot: 'bg-ink', chip: 'bg-ink/8 text-ink' },
   zhihu: { dot: 'bg-[#0084FF]', chip: 'bg-[#0084FF]/10 text-[#0084FF]' },
 }
 

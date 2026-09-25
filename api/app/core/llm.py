@@ -18,7 +18,7 @@ from typing import Any, Iterator, Optional
 from openai import OpenAI
 
 from app.core.config import get_settings, has_request_settings
-from app.core import trace
+from app.core import trace, performance
 
 
 class LLMNotConfigured(RuntimeError):
@@ -55,9 +55,6 @@ def reset_client() -> None:
     """配置更新后让下一次请求使用新的 Key 和网关。"""
     global _client
     _client = None
-
-# 进程级 token 计数（供 progress 真实上报）
-TOKEN_USAGE = {"total": 0}
 
 # 429 限速退避
 _RATE_LIMIT_BACKOFFS = [4.0, 8.0, 15.0, 25.0]
@@ -133,6 +130,10 @@ def chat(
     last_err: Exception | None = None
     provider = settings.provider_config
     use_model = model or provider.default_model
+    input_bytes = sum(len(str(item.get("content", "")).encode("utf-8")) + 64
+                      for item in messages)
+    if input_bytes > settings.llm_max_input_bytes:
+        raise ValueError(f"LLM 输入超过本地预算：{input_bytes} bytes")
     for delay in [0.0] + _RATE_LIMIT_BACKOFFS:
         if delay:
             time.sleep(delay)
@@ -152,10 +153,18 @@ def chat(
             usage = None
             try:
                 usage = resp.usage
-                if usage:
-                    TOKEN_USAGE["total"] += int(usage.total_tokens or 0)
             except Exception:
                 pass
+            cache_hit_tokens = 0
+            if usage:
+                cache_hit_tokens = int(getattr(usage, "prompt_cache_hit_tokens", 0) or 0)
+                details = getattr(usage, "prompt_tokens_details", None)
+                if not cache_hit_tokens and details:
+                    cache_hit_tokens = int(getattr(details, "cached_tokens", 0) or 0)
+            performance.record("llm", f"{provider.name}:{use_model}", latency_ms,
+                               prompt_tokens=getattr(usage, "prompt_tokens", 0),
+                               completion_tokens=getattr(usage, "completion_tokens", 0),
+                               cached_tokens=cache_hit_tokens)
             # 无侵入埋点：记录本次调用的 trace span
             try:
                 trace.record_span(
@@ -245,6 +254,10 @@ def chat_stream(
 ) -> Iterator[str]:
     """流式返回文本增量（供思维流逐条 append）。"""
     settings = get_settings()
+    input_bytes = sum(len(str(item.get("content", "")).encode("utf-8")) + 64
+                      for item in messages)
+    if input_bytes > settings.llm_max_input_bytes:
+        raise ValueError(f"LLM 输入超过本地预算：{input_bytes} bytes")
     client = _get_client()
     provider = settings.provider_config
     use_model = model or provider.default_model

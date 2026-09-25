@@ -10,6 +10,7 @@ import json
 import os
 import sqlite3
 import threading
+import time
 from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
@@ -42,6 +43,10 @@ _LOCAL = threading.local()
 _SCHEMA_READY = False
 _SCHEMA_LOCK = threading.Lock()
 _VISITOR: ContextVar[str | None] = ContextVar("verda_visitor", default=None)
+
+
+def current_visitor() -> str | None:
+    return _VISITOR.get()
 
 
 @contextmanager
@@ -199,6 +204,14 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             total_blocks INTEGER,
             data TEXT,
             updated_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS research_run_metrics (
+            task_id TEXT NOT NULL,
+            attempt INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            data TEXT NOT NULL,
+            updated_at REAL NOT NULL,
+            PRIMARY KEY(task_id, attempt)
         );
         CREATE TABLE IF NOT EXISTS visitor_resources (
             kind TEXT NOT NULL,
@@ -422,6 +435,73 @@ def dashboard_stats() -> Dict[str, Any]:
         "total_tokens": intel["total_tokens"],
         "research_cards": intel["cards"],
     }
+
+
+def performance_summary(limit: int = 60) -> Dict[str, Any]:
+    """Cross-report P50/P95 with the same visitor scoping as the dashboard."""
+    from app.core.performance import percentile
+
+    c = _connect()
+    scope, args = _scope("report", "reports.report_id")
+    rows = c.execute("SELECT task_id,data FROM reports WHERE 1=1" + scope
+                     + " ORDER BY created_at DESC LIMIT ?", (*args, max(1, min(limit, 500)))).fetchall()
+    visitor = current_visitor()
+    attempt_scope = (" AND EXISTS (SELECT 1 FROM visitor_resources vr WHERE vr.kind='task' "
+                     "AND vr.resource_id=research_run_metrics.task_id AND vr.owner_id=?)") if visitor else ""
+    attempt_args = (visitor,) if visitor else ()
+    attempts = c.execute("SELECT task_id,status,data FROM research_run_metrics WHERE 1=1"
+                         + attempt_scope + " ORDER BY updated_at DESC LIMIT ?",
+                         (*attempt_args, max(1, min(limit, 500)))).fetchall()
+    stages: Dict[str, List[float]] = {}
+    calls: Dict[str, List[float]] = {}
+    cache_hits: Dict[str, int] = {}
+    tokens = {"input": 0, "output": 0, "provider_cache_hit": 0}
+    rework = []
+    attempt_task_ids = set()
+
+    def merge_perf(perf):
+        for stage, seconds in (perf.get("stage_seconds") or {}).items():
+            stages.setdefault(stage, []).append(float(seconds))
+        for kind, entry in (perf.get("calls") or {}).items():
+            calls.setdefault(kind, []).extend(float(v) for v in entry.get("samples_ms", []))
+        for kind, count in (perf.get("cache_hits") or {}).items():
+            cache_hits[kind] = cache_hits.get(kind, 0) + int(count)
+        for kind in tokens:
+            tokens[kind] += int((perf.get("tokens") or {}).get(kind, 0))
+
+    for attempt in attempts:
+        attempt_task_ids.add(attempt["task_id"])
+        try:
+            merge_perf(json.loads(attempt["data"] or "{}"))
+        except (ValueError, TypeError):
+            continue
+    for row in rows:
+        try:
+            report = json.loads(row["data"] or "{}")
+        except (ValueError, TypeError):
+            continue
+        perf = report.get("performance") or {}
+        if row["task_id"] not in attempt_task_ids:
+            merge_perf(perf)
+        rework.append(int(((report.get("audit_review") or {}).get("rework_rounds")) or 0))
+    def summarize(values):
+        return {"samples": len(values), "p50": percentile(values, 0.5),
+                "p95": percentile(values, 0.95)}
+    return {"reports": len(rework), "attempts": len(attempts),
+            "failed_attempts": sum(a["status"] != "done" for a in attempts),
+            "stage_seconds": {k: summarize(v) for k, v in stages.items()},
+            "call_ms": {k: summarize(v) for k, v in calls.items()},
+            "cache_hits": cache_hits, "tokens": tokens,
+            "rework_rounds": summarize(rework)}
+
+
+def save_attempt_performance(task_id: str, attempt: int, status: str, snapshot: dict):
+    with _LOCK:
+        conn = _connect()
+        conn.execute("INSERT OR REPLACE INTO research_run_metrics VALUES(?,?,?,?,?)",
+                     (task_id, attempt, status, json.dumps(snapshot, ensure_ascii=False),
+                      time.time()))
+        conn.commit()
 
 
 def intel_overview() -> Dict[str, Any]:

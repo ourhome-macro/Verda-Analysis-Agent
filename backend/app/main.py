@@ -379,6 +379,11 @@ def dashboard():
     return db.dashboard_stats()
 
 
+@app.get("/api/performance")
+def performance_summary():
+    return db.performance_summary()
+
+
 # ── 全局证据溯源库 ──────────────────────────────────────
 @app.get("/api/evidences")
 def evidences(

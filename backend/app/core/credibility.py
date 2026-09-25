@@ -24,6 +24,7 @@ _BASE_BY_TYPE = {
     "zhihu": 50,
     "bilibili": 45,
     "weibo": 40,
+    "x": 40,
     "xiaohongshu": 38,
     "douyin": 35,
     "review": 32,

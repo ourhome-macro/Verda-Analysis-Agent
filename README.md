@@ -41,9 +41,9 @@
 
 **后端**：FastAPI · LangGraph 风格编排 · SQLite · SSE（Server-Sent Events 思维流）
 
-**LLM**：OpenAI 兼容 Provider；支持智谱 GLM、DeepSeek 和自定义接口。核心章、辅助章、杂务分别配置模型。未设置 `LLM_PROVIDER` 时沿用智谱默认值。
+**LLM**：OpenAI 兼容 Provider；支持智谱 GLM、DeepSeek 和自定义接口。核心章、辅助章、杂务分别配置模型。未设置 `LLM_PROVIDER` 时使用 DeepSeek 默认值。
 
-**搜索**：博查 Bocha Web Search
+**搜索**：博查 Bocha Web Search 为基础；可选 AnySearch 结构化搜索。Grok 可通过普通模型接口规划补充查询，再由 AnySearch 检索；支持服务端 `web_search` 的网关也可直接提供来源 URL。所有来源仍需抓取原网页并经证据核验。
 
 更完整的架构与数据流见 [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md)。
 
@@ -162,11 +162,17 @@ npm.cmd run dev
 | `LLM_API_KEY` / `LLM_BASE_URL` | 自定义 OpenAI 兼容接口的 Key 和网关；也可覆盖内置 Provider | custom 必填 |
 | `LLM_MODEL` / `LLM_MODEL_CORE` / `LLM_MODEL_AUX` / `LLM_MODEL_FAST` | 当前 Provider 的默认 / 核心章 / 辅助章 / 杂务模型 | custom 至少需填 `LLM_MODEL` |
 | `BOCHA_API_KEY` | 博查 Bocha Web Search Key，从 https://open.bocha.cn 获取（形如 `sk-xxxx`） | 真实联网采集时必填 |
+| `SEARCH_PROVIDERS` / `ANYSEARCH_API_KEY` | 可选搜索源列表与 AnySearch Key；如 `bocha,anysearch` | 否 |
+| `GROK_SEARCH_API_KEY` / `GROK_SEARCH_BASE_URL` / `GROK_SEARCH_MODEL` / `GROK_SEARCH_MODE` | Grok 查询规划或原生搜索配置；`planner` 用兼容聊天接口生成检索词，`native` 要求网关实际执行 Responses API 的 `web_search` | 否 |
 | `DOUYIN_COOKIE` / `BILIBILI_COOKIE` / `XHS_COOKIE` | 各平台舆情采集 cookie | 平台采集时按需 |
 | `APP_PORT` | 后端端口（默认 8000，本地脚本用 8010） | 否 |
 | `FRONTEND_ORIGIN` | 前端地址（CORS 白名单），默认 `http://localhost:3400` | 否 |
 
 DeepSeek 示例：`LLM_PROVIDER=deepseek`，在 `backend/.env` 填 `DEEPSEEK_API_KEY`。默认使用 `deepseek-flash`，核心章节使用 `deepseek-v4-pro`；本地调试时可设置 `LLM_MODEL_CORE=deepseek-flash`。真实搜索还需填写 `BOCHA_API_KEY`。
+
+设置 `SEARCH_PROVIDERS=bocha,anysearch,grok` 且 `GROK_SEARCH_MODE=planner` 后，社区维度每个品牌最多让 Grok 规划一次补充检索词，由 AnySearch 返回可抓取的来源 URL；其他查询不会额外消耗 Grok 调用。若网关实际支持服务端搜索，可改用 `GROK_SEARCH_MODE=native`。模型生成的文字不能直接作为证据。`GET /api/performance` 返回最近可访问报告的阶段 P50/P95、搜索与抓取耗时、Token、缓存命中及返工统计。搜索与正文缓存存于 SQLite，最多各 2000 条；TTL 根据时效与维度缩短，最长 7 天。
+
+当研究市场明确为海外/全球时，社区维度还会检索 X 帖子：`planner` 模式由 Grok 规划站内查询、AnySearch 找到帖子；`native` 模式优先使用真实的 xAI `x_search` 工具，失败时回退结构化搜索。X 帖子同样要取得正文后才能作为口碑证据，单条帖子不能代表全部用户。
 
 本机联调也可通过左下角「林研究员」打开「模型与搜索配置」，填写模型 Key 和博查 Key。先在未提交的 `backend/.env` 中设置 `LOCAL_SETTINGS_ENABLED=true`，并让前后端只监听本机地址。页面不会回显已保存的 Key；输入框留空表示保留原值。保存后立即应用于后续请求。云端部署始终禁用该写入接口。
 

@@ -38,12 +38,13 @@ from app.core.research_contract import (VERSION as RESEARCH_VERSION, build_contr
 from app.core.audit import evaluate_quality, decide_rework, llm_quality_review
 from app.core.config import get_settings
 from app.core.credibility import score_evidence, freshness_days
-from app.core.fetcher import domain_of, fetch_page
-from app.core.llm import chat, chat_json, LLMNotConfigured, TOKEN_USAGE
+from app.core.fetcher import domain_of, cached_fetch_page, is_public_http_url
+from app.core.llm import chat, chat_json, LLMNotConfigured
 from app.core.metrics import compute_report_metrics, merge_quality_into_metrics
 from app.core.models import Evidence, Envelope, make_claim
 from app.core.schemas import coerce_feature_tree, coerce_pricing_model, coerce_user_persona
 from app.core.search import multi_search
+from app.core import performance
 from app.core.sentiment import analyze_sentiment, PLATFORM_LABEL, PLATFORM_SITES
 from app.core.textquality import is_relevant_content
 from app.data import expert_by_id, load_experts
@@ -413,6 +414,8 @@ def _ev(type_: str, data: Dict[str, Any]) -> Dict[str, Any]:
 
 def _source_type(url: str) -> str:
     d = domain_of(url)
+    if d in ("x.com", "twitter.com"):
+        return "x"
     if "douyin" in d:
         return "douyin"
     if "xiaohongshu" in d or "xhs" in d:
@@ -496,6 +499,12 @@ def _sentiment_relevant(brand: str, cat_keywords: List[str], title: str, text: s
 
 
 # ── 采集单品牌（抽出供补采复用）─────────────────────────────
+def _overseas_market(market: str) -> bool:
+    value = (market or "").lower()
+    return (any(word in value for word in ("海外", "国际", "全球", "美国", "北美", "欧洲", "欧盟", "英国", "日本", "澳洲"))
+            or bool(re.search(r"\b(us|usa|global|international|europe|uk|japan|australia)\b", value)))
+
+
 def _collect_brand(brand: str, angles: List[str], collector: str,
                    fetch_limit: int, freshness: str,
                    existing_urls: set, contract=None, dimensions=None) -> Dict[str, Any]:
@@ -516,17 +525,26 @@ def _collect_brand(brand: str, angles: List[str], collector: str,
         if source == "community":
             queries = [f"{brand} {contract['market']} {contract['user']} 使用体验 评价",
                        f"{brand} 社区 讨论 缺点"]
-        recent = multi_search(queries, num=5, freshness=freshness)
+        recent = multi_search(queries, num=5, freshness=freshness, source_kind=source,
+                              use_grok=(source == "community" and
+                                        not contract.get("overseas_social", _overseas_market(contract.get("market", "")))))
         baseline = []
         if source == "community":
             # Short brand query + source routing avoids over-constrained long queries.
             for site in ("sspai.com", "v2ex.com"):
-                recent += multi_search([brand], num=3, site=site, freshness=freshness)
+                recent += multi_search([brand], num=3, site=site, freshness=freshness,
+                                       source_kind=source)
                 if freshness != "noLimit":
-                    baseline += multi_search([brand], num=3, site=site, freshness="noLimit")
+                    baseline += multi_search([brand], num=3, site=site, freshness="noLimit",
+                                             source_kind=source)
+            if contract.get("overseas_social", _overseas_market(contract.get("market", ""))):
+                recent += multi_search([f"{brand} user review complaints site:x.com"], num=5,
+                                       site="x.com|twitter.com", freshness=freshness,
+                                       source_kind="x", use_grok=True)
         if source == "official" and source_profile["domains"]:
             baseline = multi_search([f"{brand} {topic}"], num=6,
-                                    site="|".join(source_profile["domains"]), freshness="noLimit")
+                                    site="|".join(source_profile["domains"]),
+                                    freshness="noLimit", source_kind=source)
         seeds = []
         seeds = [{"url": u, "title": f"{brand} {dim['label']}官方资料", "snippet": "", "captured_at": ""}
                  for u in source_profile.get("dimension_seeds", {}).get(key, [])]
@@ -547,7 +565,7 @@ def _collect_brand(brand: str, angles: List[str], collector: str,
             url = r.get("url", "")
             canonical = canonical_url(url)
             identity = (brand, key, canonical)
-            if not canonical or identity in existing_urls or canonical in attempted:
+            if not canonical or not is_public_http_url(url) or identity in existing_urls or canonical in attempted:
                 continue
             attempted.add(canonical)
             # Do not spend rendering budgets on tenant pages or unrelated source roles.
@@ -561,7 +579,12 @@ def _collect_brand(brand: str, angles: List[str], collector: str,
             if source_time(pub_date, contract) == "future":
                 continue
             if canonical not in page_cache:
-                page_cache[canonical] = fetch_page(url, fallback_snippet=r.get("snippet", ""))
+                page_ttl = (3600 if source == "community" or freshness == "oneDay"
+                            else 21600 if key == "pricing_model" or freshness == "oneWeek"
+                            else 7 * 86400 if source == "official" and freshness == "noLimit"
+                            else 86400)
+                page_cache[canonical] = cached_fetch_page(
+                    url, fallback_snippet=r.get("snippet", ""), ttl_seconds=page_ttl)
             page = page_cache[canonical]
             pub_date = page.get("published_at") or pub_date
             if source_time(pub_date, contract) == "future":
@@ -586,7 +609,9 @@ def _collect_brand(brand: str, angles: List[str], collector: str,
                           freshness_days=freshness_days(pub_date) if pub_date else None,
                           full_text=text, origin_url=page.get("origin_url", ""),
                           fetch_kind=page.get("fetch_kind", "snippet"), published_at=pub_date,
-                          research_dimensions=[key], search_freshness=freshness, research_version=RESEARCH_VERSION)
+                           research_dimensions=[key], search_freshness=freshness,
+                           research_version=RESEARCH_VERSION,
+                           search_provider=r.get("search_provider", "seed"))
             out_ev.append(ev)
             fetched += 1
             if contract["industry"] == "automotive" and url.rstrip("/") in [u.rstrip("/") for u in source_profile["seeds"]]:
@@ -616,13 +641,13 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
     perspective = _normalize_perspective(clar.get("perspective", ""))
 
     t_start = time.monotonic()
-    token_start = TOKEN_USAGE["total"]
     progress = {"percent": 0, "evidence_count": 0, "token_used": 0, "stage": "intake"}
 
     def prog(percent: int, stage: str, ev_count: int) -> Dict[str, Any]:
         progress.update({
             "percent": percent, "stage": stage, "evidence_count": ev_count,
-            "token_used": TOKEN_USAGE["total"] - token_start,
+            "token_used": sum(performance.snapshot(task_id).get("tokens", {}).get(k, 0)
+                              for k in ("input", "output")),
         })
         return dict(progress)
 
@@ -647,6 +672,8 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
     focus = plan["focus"]
     angles = plan["angles"]
     contract = build_contract(brands, focus, clar, query)
+    contract["overseas_social"] = (_overseas_market(contract.get("market", ""))
+                                   or _overseas_market(query))
     cfg["freshness"] = contract["freshness"]
     yield _ev("message", {"id": _sid("m"), "kind": "research_contract", "contract": contract})
     yield _ev("thought", {"id": _sid("th"), "kind": "plan", "expert": "L3-001",
@@ -697,22 +724,34 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
     collect_notes: List[str] = []
     collection_diagnostics = []
     seen_urls: set = set()
-
     # Contract-aware collection: old checkpoints cannot silently satisfy new scope/time constraints.
     checkpoint = task_runtime.collection_checkpoint(task_id)
+    collect_limit = max(1, min(3, get_settings().collect_brand_concurrency))
+    collect_sem = asyncio.Semaphore(collect_limit)
+
+    async def _collect_one(brand):
+        async with collect_sem:
+            trace.set_context(task_id, collector, "collect", f"采集竞品「{brand}」证据")
+            cached = [e for e in checkpoint if e.brand == brand and e.research_version == RESEARCH_VERSION
+                      and e.search_freshness == cfg["freshness"]]
+            local_seen = {(brand, dim, canonical_url(e.source_url))
+                          for e in cached for dim in e.research_dimensions}
+            missing_dims = [d for d in contract["dimensions"]
+                            if sum(d["key"] in e.research_dimensions for e in cached) < 3]
+            result = (await asyncio.to_thread(_collect_brand, brand, angles, collector,
+                                              cfg["fetch_per_brand"], cfg["freshness"],
+                                              local_seen, contract, missing_dims)
+                      if missing_dims else {"evidences": [], "images": [], "found": 0})
+            result["evidences"] = cached + result["evidences"]
+            return brand, result
+
     for brand in brands:
         yield _ev("thought", {"id": _sid("th"), "kind": "action", "expert": collector,
                               "text": f"按指定维度采集「{brand}」：{'、'.join(focus)}。", "ts": _now()})
+    collect_jobs = [asyncio.create_task(_collect_one(brand)) for brand in brands]
+    for job in asyncio.as_completed(collect_jobs):
+        brand, res = await job
         trace.set_context(task_id, collector, "collect", f"采集竞品「{brand}」证据")
-        cached = [e for e in checkpoint if e.brand == brand and e.research_version == RESEARCH_VERSION
-                  and e.search_freshness == cfg["freshness"]]
-        for ev in cached:
-            seen_urls.update((brand, d, canonical_url(ev.source_url)) for d in ev.research_dimensions)
-        missing_dims = [d for d in contract["dimensions"] if sum(d["key"] in e.research_dimensions for e in cached) < 3]
-        res = (await asyncio.to_thread(_collect_brand, brand, angles, collector,
-                                      cfg["fetch_per_brand"], cfg["freshness"], seen_urls, contract, missing_dims)
-               if missing_dims else {"evidences": [], "images": [], "found": 0})
-        res["evidences"] = cached + res["evidences"]
         collection_diagnostics.extend({**d, "round": 0} for d in res.get("diagnostics", []))
         for e in _drain_trace():
             yield e
@@ -721,7 +760,7 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
             # 记录可观测 span：本次检索动作即便无果也可追溯
             trace.record_manual_span(
                 task_id, collector, "collect", f"采集竞品「{brand}」证据",
-                detail=f"检索角度：{('、'.join(angles))}\n搜索引擎：博查 Bocha（freshness={cfg['freshness']}）",
+                detail=f"检索角度：{('、'.join(angles))}\n搜索源：{get_settings().search_providers}（freshness={cfg['freshness']}）",
                 decision=f"「{brand}」未返回有效结果，已如实标注、不中断。",
             )
             for e in _drain_trace():
@@ -735,6 +774,8 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
                               "ts": _now()})
         for ev in res["evidences"]:
             evidences.append(ev)
+            seen_urls.update((ev.brand, dim, canonical_url(ev.source_url))
+                             for dim in ev.research_dimensions)
             ev_by_collector[collector] += 1
             d = ev.to_dict()
             d["domain"] = domain_of(ev.source_url)
@@ -753,7 +794,7 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
         trace.record_manual_span(
             task_id, collector, "collect", f"采集竞品「{brand}」证据",
             detail=(f"检索角度（{len(angles)}个）：{('、'.join(angles))}\n"
-                    f"搜索引擎：博查 Bocha Web Search（freshness={cfg['freshness']}）"),
+                     f"搜索源：{get_settings().search_providers}（freshness={cfg['freshness']}）"),
             decision=(f"聚合 {res['found']} 条去重链接 → 抓取取证 {len(brand_evs)} 条，"
                       f"覆盖 {len(brand_domains)} 个独立域名。"),
             evidence_ids=[ev.evidence_id for ev in brand_evs[:8]],
@@ -973,7 +1014,8 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
     yield _ev("progress", prog(95, "done", len(evidences)))
 
     elapsed = time.monotonic() - t_start
-    tokens_used = TOKEN_USAGE["total"] - token_start
+    perf_now = performance.snapshot(task_id)
+    tokens_used = sum(perf_now.get("tokens", {}).get(k, 0) for k in ("input", "output"))
     metrics = compute_report_metrics(
         brands=brands, focus=focus, claims=claims, evidences=evidences,
         structured=structured, elapsed_seconds=elapsed, tokens_used=tokens_used,
@@ -1005,12 +1047,17 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
                    for b in brands},
     }
     yield _ev("progress", prog(96, "final_audit", len(evidences)))
+    performance.on_node_update(task_id, {"node": "final_audit", "status": "working"})
     trace.set_context(task_id, auditor, "final_audit", "最终报告审校与引用台账")
     report = await asyncio.to_thread(finalize_report, report, model=_model("aux"))
+    performance.on_node_update(task_id, {"node": "final_audit", "status": "done"})
     for e in _drain_trace():
         yield e
     trace_spans = trace.get_trace(task_id)
     report["trace"] = trace_spans
+    report["performance"] = performance.snapshot(task_id)
+    report["metrics"]["efficiency"]["tokens_used"] = sum(
+        report["performance"].get("tokens", {}).get(k, 0) for k in ("input", "output"))
     db.save_report(report, task_id=task_id)
     db.save_traces(task_id, report["id"], trace_spans)
     db.mark_task_done(task_id, report["id"])

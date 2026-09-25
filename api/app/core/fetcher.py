@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import datetime as _dt
+import ipaddress
+import time
 from typing import Any, Dict, List, Optional
 from urllib.parse import urljoin, urlparse
 
@@ -30,6 +32,23 @@ def domain_of(url: str) -> str:
         return ""
 
 
+def is_public_http_url(url: str) -> bool:
+    """Reject local hosts and private IP literals before fetching provider URLs."""
+    try:
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower().rstrip(".")
+        if parsed.scheme not in ("http", "https") or not host or parsed.username or parsed.password:
+            return False
+        if host == "localhost" or host.endswith((".localhost", ".local", ".internal")):
+            return False
+        try:
+            return ipaddress.ip_address(host).is_global
+        except ValueError:
+            return True
+    except ValueError:
+        return False
+
+
 def fetch_page(url: str, *, fallback_snippet: str = "") -> Dict[str, Any]:
     """抓取单页正文 + 图片。返回 {text, images, ok, degraded}。"""
     result: Dict[str, Any] = {
@@ -44,10 +63,18 @@ def fetch_page(url: str, *, fallback_snippet: str = "") -> Dict[str, Any]:
         "product_links": [],
         "published_at": "",
     }
+    if not is_public_http_url(url):
+        result["captured_at"] = _now()
+        return result
     try:
+        def validate_redirect(request: httpx.Request):
+            if not is_public_http_url(str(request.url)):
+                raise ValueError("unsafe page URL")
+
         with httpx.Client(
             timeout=_TIMEOUT,
             follow_redirects=True,
+            event_hooks={"request": [validate_redirect]},
             headers={"User-Agent": _UA, "Accept-Language": "zh-CN,zh;q=0.9"},
         ) as client:
             r = client.get(url)
@@ -110,6 +137,26 @@ def fetch_page(url: str, *, fallback_snippet: str = "") -> Dict[str, Any]:
         # 降级保留 snippet
         pass
     result["captured_at"] = _now()
+    return result
+
+
+def cached_fetch_page(url: str, *, fallback_snippet: str = "",
+                      ttl_seconds: int = 86400) -> Dict[str, Any]:
+    """Cache only successfully fetched public bodies; snippets are request-specific."""
+    from app.core import db, performance, research_cache
+    from app.core.source_policy import canonical_url
+
+    key = research_cache.key_for("page", db.current_visitor() or "server",
+                                 canonical_url(url) or url)
+    hit = research_cache.get("page", key, max_age_seconds=ttl_seconds)
+    if hit is not None:
+        performance.record("fetch", host_of(url), 0, cache_hit=True)
+        return hit
+    started = time.perf_counter()
+    result = fetch_page(url, fallback_snippet=fallback_snippet)
+    performance.record("fetch", host_of(url), (time.perf_counter() - started) * 1000)
+    if result.get("ok") and result.get("fetch_kind") in ("body", "rendered"):
+        research_cache.put("page", key, result, ttl_seconds)
     return result
 
 
