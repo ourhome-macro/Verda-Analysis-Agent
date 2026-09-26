@@ -64,12 +64,21 @@ class Settings(BaseSettings):
     # DeepSeek：默认关闭思考模式以适配现有 JSON 解析流程。
     deepseek_api_key: str = ""
     deepseek_base_url: str = "https://api.deepseek.com"
-    # 单次 LLM 调用超时（秒）与自动重试次数，避免请求卡死拖垮整个服务。
-    # analyze 等重型 JSON 调用（claims+对比+定价+五力+趋势一次产出）在大 max_tokens
-    # 下耗时较长，180s 给足余量；max_retries 设 1，避免超时后再叠加 2 次重试（最坏 3×timeout）。
+    # 单次上游调用超时；SDK 内置重试已禁用，由 llm_attempts 显式控制。
     llm_timeout: float = 180.0
-    llm_max_retries: int = 1
+    llm_max_retries: int = 0  # retained for old environment files; ignored
     llm_max_input_bytes: int = 180000
+    # All limits apply to one serving process. Disable SDK's hidden retries in favor of these.
+    outbound_global_requests_per_second: float = 4.0
+    outbound_global_max_in_flight: int = 6
+    llm_requests_per_second: float = 2.0
+    llm_max_in_flight: int = 3
+    llm_max_queue_wait: float = 90.0
+    llm_attempts: int = 3
+    llm_retry_base_seconds: float = 1.0
+    llm_retry_max_seconds: float = 20.0
+    write_batch_size: int = 3
+    analyze_batch_size: int = 3
 
     # 搜索 API（博查 Bocha Web Search：https://open.bocha.cn 获取 key）
     bocha_api_key: str = ""
@@ -86,6 +95,9 @@ class Settings(BaseSettings):
     grok_requests_per_second: float = 1.0
     search_max_in_flight: int = 2
     search_max_queue_wait: float = 60.0
+    search_attempts: int = 3
+    search_retry_base_seconds: float = 1.0
+    search_retry_max_seconds: float = 20.0
     collect_brand_concurrency: int = 2
     # 单次搜索超时（秒）
     search_timeout: float = 30.0

@@ -977,19 +977,21 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
             cfg["min_paragraphs"], cfg["para_words"], cfg["section_max_tokens"]
         )
 
-    tasks = [asyncio.create_task(_write_one(sid)) for sid in section_ids]
     done_count = 0
-    total = len(tasks)
-    for coro in asyncio.as_completed(tasks):
-        sid, st = await coro
-        sections_text[sid] = st
-        done_count += 1
-        for e in _drain_trace():
-            yield e
-        title = dict(section_plan(focus)).get(sid, dict(SECTION_PLAN).get(sid, sid))
-        yield _ev("thought", {"id": _sid("th"), "kind": "finding", "expert": writer,
-                              "text": f"第 {done_count}/{total} 章「{title}」撰写完成。", "ts": _now()})
-        yield _ev("progress", prog(70 + int(16 * done_count / total), "write", len(evidences)))
+    total = len(section_ids)
+    batch_size = max(1, min(8, get_settings().write_batch_size))
+    for start in range(0, total, batch_size):
+        tasks = [asyncio.create_task(_write_one(sid)) for sid in section_ids[start:start + batch_size]]
+        for coro in asyncio.as_completed(tasks):
+            sid, st = await coro
+            sections_text[sid] = st
+            done_count += 1
+            for e in _drain_trace():
+                yield e
+            title = dict(section_plan(focus)).get(sid, dict(SECTION_PLAN).get(sid, sid))
+            yield _ev("thought", {"id": _sid("th"), "kind": "finding", "expert": writer,
+                                  "text": f"第 {done_count}/{total} 章「{title}」撰写完成。", "ts": _now()})
+            yield _ev("progress", prog(70 + int(16 * done_count / total), "write", len(evidences)))
 
     # 舆情专章：基于真实评论数据生成多段深度解读（与正文同等深度）
     sentiment_text: Dict[str, Any] = {"paragraphs": [], "key_takeaway": "", "highlights": []}
@@ -1086,19 +1088,21 @@ def _analyze(query, brands, focus, evidences: List[Evidence], members: List[str]
     contract = contract or build_contract(brands, focus, query=query)
     from concurrent.futures import ThreadPoolExecutor
     from contextvars import copy_context
-    jobs = []
-    with ThreadPoolExecutor(max_workers=3) as pool:
-        for brand in brands:
-            for dim in contract["dimensions"]:
-                if target_cells is not None and cell_id(brand, dim["key"]) not in target_cells:
-                    continue
+    cells = [(brand, dim) for brand in brands for dim in contract["dimensions"]
+             if target_cells is None or cell_id(brand, dim["key"]) in target_cells]
+    parts = []
+    batch_size = max(1, min(8, get_settings().analyze_batch_size))
+    with ThreadPoolExecutor(max_workers=batch_size) as pool:
+        for start in range(0, len(cells), batch_size):
+            jobs = []
+            for brand, dim in cells[start:start + batch_size]:
                 relevant = [e for e in evidences if e.brand == brand and (
                     not e.research_dimensions or dim["key"] in e.research_dimensions)]
                 jobs.append(pool.submit(copy_context().run, _analyze_brand, query, [brand], [dim["label"]],
                                         relevant, members, min(max_tokens_param, 2200),
                                         (cell_feedback or {}).get(cell_id(brand, dim["key"]), review_feedback),
                                         contract=contract))
-        parts = [job.result() for job in jobs]
+            parts.extend(job.result() for job in jobs)
     return {"claims": [c for part in parts for c in part["claims"]],
             "analysis_errors": [p["analysis_error"] for p in parts if p.get("analysis_error")],
             "evidence_selection": [p for part in parts for p in part.get("evidence_selection", [])],

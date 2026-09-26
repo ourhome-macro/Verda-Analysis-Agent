@@ -75,7 +75,8 @@ def post_json(provider: str, base_url: str, credential: str, path: str,
     for attempt in range(3):
         started = time.perf_counter()
         try:
-            with outbound_limit.permit(limiter, per_second=rate,
+            with outbound_limit.settings_permit(provider, base_url, credential, settings,
+                                       per_second=rate,
                                        max_in_flight=settings.search_max_in_flight,
                                        max_wait=settings.search_max_queue_wait):
                 with httpx.Client(timeout=httpx.Timeout(connect=8, read=timeout, write=5, pool=5),

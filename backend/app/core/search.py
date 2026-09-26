@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import datetime as _dt
 import re
+import logging
+import random
 import time
 from typing import List, Optional
 
@@ -20,6 +22,8 @@ from app.core.config import get_settings
 from app.core import outbound_limit, performance, trace
 from app.core.search_extra import (SearchProviderError, cached, search_anysearch,
                                    search_grok, search_grok_planned, search_grok_x, valid_url, x_post_url)
+
+log = logging.getLogger("uvicorn.error")
 
 # 博查异常码 → 人话提示
 _BOCHA_ERR = {
@@ -116,8 +120,8 @@ def _search_bocha_uncached(
     )
     with httpx.Client(timeout=timeout, follow_redirects=True) as client:
         started = time.perf_counter()
-        with outbound_limit.permit(
-            outbound_limit.scope("bocha", settings.bocha_base_url, settings.bocha_api_key),
+        with outbound_limit.settings_permit(
+            "bocha", settings.bocha_base_url, settings.bocha_api_key, settings,
             per_second=settings.bocha_requests_per_second,
             max_in_flight=settings.search_max_in_flight,
             max_wait=settings.search_max_queue_wait,
@@ -126,7 +130,9 @@ def _search_bocha_uncached(
         performance.record("search", "bocha", (time.perf_counter() - started) * 1000)
         if r.status_code != 200:
             msg = _BOCHA_ERR.get(r.status_code, f"博查接口返回 HTTP {r.status_code}")
-            raise SearchProviderError("bocha", r.status_code, msg)
+            error = SearchProviderError("bocha", r.status_code, msg)
+            error.retry_after = r.headers.get("Retry-After", "")
+            raise error
         body = r.json()
 
     # 博查在 HTTP 200 时仍可能在 body 内返回错误码
@@ -175,14 +181,29 @@ def search_bocha(query: str, *, num: int = 10, site: Optional[str] = None,
     limiter = outbound_limit.scope("bocha", settings.bocha_base_url, settings.bocha_api_key)
 
     def produce():
-        for attempt in range(3):
+        for attempt in range(max(1, settings.search_attempts)):
             try:
                 return _search_bocha_uncached(query, num=num, site=site, freshness=freshness)
-            except SearchProviderError as exc:
-                if exc.status != 429 or attempt == 2:
+            except (SearchProviderError, httpx.TimeoutException, httpx.TransportError) as exc:
+                status = getattr(exc, "status", None)
+                if (status not in (None, 408, 429, 500, 502, 503, 504)
+                        or attempt + 1 >= max(1, settings.search_attempts)):
+                    log.warning("outbound_failed provider=bocha attempt=%d error=%s status=%s",
+                                attempt + 1, type(exc).__name__, status)
                     raise
-                outbound_limit.cool_down(limiter, min(20.0, 2 ** attempt + 1))
+                delay = min(settings.search_retry_max_seconds,
+                            settings.search_retry_base_seconds * 2 ** attempt + random.uniform(0, 0.5))
+                try:
+                    delay = min(settings.search_retry_max_seconds,
+                                max(delay, float(getattr(exc, "retry_after", ""))))
+                except (TypeError, ValueError):
+                    pass
+                log.warning("outbound_retry provider=bocha attempt=%d delay_ms=%d error=%s status=%s",
+                            attempt + 1, int(delay * 1000), type(exc).__name__, status)
+                if status == 429:
+                    outbound_limit.cool_down(limiter, delay)
                 performance.record("search_retry", "bocha", 0, retry=True)
+                time.sleep(delay)
         return []
 
     return cached("bocha", settings.bocha_api_key, query, num, site,

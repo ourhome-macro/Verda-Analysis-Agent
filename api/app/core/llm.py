@@ -9,16 +9,20 @@
 from __future__ import annotations
 
 import json
+import logging
+import random
 import re
 import time
 from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any, Iterator, Optional
 
-from openai import OpenAI
+from openai import OpenAI, APIConnectionError, APITimeoutError
 
 from app.core.config import get_settings, has_request_settings
-from app.core import trace, performance
+from app.core import trace, performance, outbound_limit
+
+log = logging.getLogger("uvicorn.error")
 
 
 class LLMNotConfigured(RuntimeError):
@@ -41,7 +45,7 @@ def use_request_client():
         api_key=provider.api_key,
         base_url=provider.base_url,
         timeout=settings.llm_timeout,
-        max_retries=settings.llm_max_retries,
+        max_retries=0,
     )
     token = _request_client.set(client)
     try:
@@ -56,13 +60,28 @@ def reset_client() -> None:
     global _client
     _client = None
 
-# 429 限速退避
-_RATE_LIMIT_BACKOFFS = [4.0, 8.0, 15.0, 25.0]
+def _retry_delay(exc: Exception, attempt: int, settings) -> float:
+    delay = min(settings.llm_retry_max_seconds,
+                settings.llm_retry_base_seconds * (2 ** attempt) + random.uniform(0, 0.5))
+    response = getattr(exc, "response", None)
+    hint = getattr(response, "headers", {}).get("retry-after", "") if response is not None else ""
+    try:
+        delay = max(delay, float(hint))
+    except (TypeError, ValueError):
+        pass
+    return min(settings.llm_retry_max_seconds, delay)
 
 
-def _is_rate_limit(err: Exception) -> bool:
-    msg = str(err)
-    return "429" in msg or "rate" in msg.lower() or "1302" in msg
+def _transient(exc: Exception) -> bool:
+    return (isinstance(exc, (APIConnectionError, APITimeoutError)) or
+            getattr(exc, "status_code", None) in (408, 429, 500, 502, 503, 504))
+
+
+def _permit(settings, provider):
+    return outbound_limit.settings_permit(
+        provider.name, provider.base_url, provider.api_key, settings,
+        per_second=settings.llm_requests_per_second,
+        max_in_flight=settings.llm_max_in_flight, max_wait=settings.llm_max_queue_wait)
 
 
 def _get_client() -> OpenAI:
@@ -83,7 +102,7 @@ def _get_client() -> OpenAI:
             api_key=provider.api_key,
             base_url=provider.base_url,
             timeout=settings.llm_timeout,
-            max_retries=settings.llm_max_retries,
+            max_retries=0,
         )
     return _client
 
@@ -134,9 +153,7 @@ def chat(
                       for item in messages)
     if input_bytes > settings.llm_max_input_bytes:
         raise ValueError(f"LLM 输入超过本地预算：{input_bytes} bytes")
-    for delay in [0.0] + _RATE_LIMIT_BACKOFFS:
-        if delay:
-            time.sleep(delay)
+    for attempt in range(max(1, settings.llm_attempts)):
         try:
             kwargs = dict(
                 model=use_model,
@@ -147,7 +164,8 @@ def chat(
             if _supports_thinking(provider.name, use_model):
                 kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
             t0 = time.perf_counter()
-            resp = client.chat.completions.create(**kwargs)
+            with _permit(settings, provider):
+                resp = client.chat.completions.create(**kwargs)
             latency_ms = int((time.perf_counter() - t0) * 1000)
             content = _strip_think(resp.choices[0].message.content or "")
             usage = None
@@ -181,8 +199,18 @@ def chat(
             return content
         except Exception as e:  # noqa: BLE001
             last_err = e
-            if not _is_rate_limit(e):
+            if not _transient(e) or attempt + 1 >= max(1, settings.llm_attempts):
+                log.warning("outbound_failed provider=%s operation=chat attempt=%d error=%s",
+                            provider.name, attempt + 1, type(e).__name__)
                 raise
+            delay = _retry_delay(e, attempt, settings)
+            log.warning("outbound_retry provider=%s operation=chat attempt=%d delay_ms=%d error=%s",
+                        provider.name, attempt + 1, int(delay * 1000), type(e).__name__)
+            if getattr(e, "status_code", None) == 429:
+                outbound_limit.cool_down(outbound_limit.scope(provider.name, provider.base_url,
+                                                               provider.api_key), delay)
+            performance.record("llm_retry", provider.name, 0, retry=True)
+            time.sleep(delay)
     assert last_err is not None
     raise last_err
 
@@ -265,8 +293,29 @@ def chat_stream(
                   max_tokens=max_tokens, stream=True)
     if _supports_thinking(provider.name, use_model):
         kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
-    stream = client.chat.completions.create(**kwargs)
-    for chunk in stream:
-        delta = chunk.choices[0].delta.content
-        if delta:
-            yield delta
+    for attempt in range(max(1, settings.llm_attempts)):
+        emitted = False
+        try:
+            with _permit(settings, provider):
+                stream = client.chat.completions.create(**kwargs)
+                try:
+                    for chunk in stream:
+                        delta = chunk.choices[0].delta.content
+                        if delta:
+                            emitted = True
+                            yield delta
+                finally:
+                    close = getattr(stream, "close", None)
+                    if close:
+                        close()
+            return
+        except Exception as exc:
+            if emitted or not _transient(exc) or attempt + 1 >= max(1, settings.llm_attempts):
+                raise
+            delay = _retry_delay(exc, attempt, settings)
+            log.warning("outbound_retry provider=%s operation=stream attempt=%d delay_ms=%d error=%s",
+                        provider.name, attempt + 1, int(delay * 1000), type(exc).__name__)
+            if getattr(exc, "status_code", None) == 429:
+                outbound_limit.cool_down(outbound_limit.scope(provider.name, provider.base_url,
+                                                               provider.api_key), delay)
+            time.sleep(delay)
