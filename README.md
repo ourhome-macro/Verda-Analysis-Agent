@@ -1,221 +1,49 @@
-# 青野 Verda · AI 竞品情报工作台
+# Verda Analysis Agent
 
-> 让每个结论都有出处，让每次调研都活着。
+Verda 是一个基于真实网页证据的竞品调研工作台。用户确认研究对象、竞品、维度和时效范围后，系统执行搜索与正文采集、逐条事实核验、矩阵质检、定向 Replan，并生成带来源引用的报告。
 
-[![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](./LICENSE)
-[![Python](https://img.shields.io/badge/Python-3.9%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![React](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=black)](https://react.dev/)
-[![FastAPI](https://img.shields.io/badge/FastAPI-0.115-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
-[![Built with TRAE](https://img.shields.io/badge/Built%20with-TRAE%20AI-7C5CFF.svg)](https://www.trae.ai/)
+## 能力
 
-青野 Verda 是一个**会自己组队、能溯源、看得见思考过程**的「AI 竞品情报工作台」。
-它把一支由 48 位虚拟专家组成的多 Agent 团队封装进一条 Deep Research 流水线：从澄清需求、真实联网采集、交叉验证、结构化分析，到并行撰写一份带证据溯源的竞品研究报告——全程可观测、可回放、可人工介入二次深化。
+- **研究契约**：把品牌、维度和研究截止日固定为品牌 × 维度矩阵；用户选择的竞品不会替代原始调研对象。
+- **证据链**：博查搜索、网页抓取、来源准入、Claim 原文引句核验与最终报告审校。
+- **有限返工**：按矩阵缺口修订目标单元的检索词并补采；快速、深度、专家模式分别允许 0、1、2 轮，始终不超过 2 轮。
+- **出站保护**：单凭据、供应商和单进程全局的请求速率与在途并发限制，带超时、有限重试和日志。
+- **可观测性**：SSE 进度、阶段与模型摘要 Trace、证据快照和报告质量状态。Trace 尚不提供逐次搜索/抓取请求的完整回放。
 
-- **真实，不演示**：可配置 LLM Provider（智谱 GLM / DeepSeek / 自定义 OpenAI 兼容接口）+ 真实联网搜索（博查 Bocha）+ 真实网页抓取 + SQLite 持久化。搜不到就如实标注「未采集到」，绝不编造假数据。
-- **每个结论都有出处**：四条铁律——无证据不立论 / 交叉验证 / 返工闭环 / 全程可观测。
-- **看得见的思考**：每个 Agent 的 Prompt、输入输出、Token、决策、引用证据全部落 Trace，可在工作台实时滚动、在报告页「决策回放」。
+## 本地运行
 
-> 本项目在开发过程中深度使用 [TRAE](https://www.trae.ai/) AI 编程工具协作完成，设计与演进过程见 [docs/系统升级实施方案.md](./docs/系统升级实施方案.md)。
-
----
-
-## ✨ 核心特性
-
-| 能力 | 说明 |
-|---|---|
-| 🧠 多 Agent 编排 | 48 位分层虚拟专家（决策层 / 策略层 / 执行层），按任务自动组队、指派、终审 |
-| 🔎 Deep Research 流水线 | `intake → orchestrator → collect → analyze → write → audit → done`，带返工闭环 |
-| 🌐 真实联网采集 | 博查 Bocha 多角度多轮搜索 + 真实正文抓取 + 乱码/相关性过滤 |
-| 📊 结构化知识 Schema | 功能树 / 定价模型 / 用户画像三类强结构对象，前端渲染矩阵、定价表、画像卡 |
-| 🔬 可信度真实计算 | 按来源分级 + 域名权威性 + 时效性 + 抓取质量打分（0–100，非写死） |
-| 📈 量化提升 & 业务闭环指标 | 效率提升 / 覆盖度 / 一致性 / 准确率 / 人工修正率，每项可解释 |
-| 👀 全链路可观测 Trace | 每个 Agent 的 Prompt/输出/Token/决策可查、可回放 |
-| ✍️ 批注驱动二次调研 | 对报告正文划线批注 → 触发针对性补充调研并更新章节 |
-| 🎚️ 三档调研模式 | 快速 / 深度 / 专家级，按搜索量 + 章节数 + 模型档位分档 |
-
----
-
-## 🏗️ 技术栈
-
-**前端**：React 19 · TypeScript · Vite · TailwindCSS · Zustand · React Router · ReactFlow · ECharts / D3 · Framer Motion
-
-**后端**：FastAPI · LangGraph 风格编排 · SQLite · SSE（Server-Sent Events 思维流）
-
-**LLM**：OpenAI 兼容 Provider；支持智谱 GLM、DeepSeek 和自定义接口。核心章、辅助章、杂务分别配置模型。未设置 `LLM_PROVIDER` 时使用 DeepSeek 默认值。
-
-**搜索**：博查 Bocha Web Search 为基础；可选 AnySearch 结构化搜索。Grok 可通过普通模型接口规划补充查询，再由 AnySearch 检索；支持服务端 `web_search` 的网关也可直接提供来源 URL。所有来源仍需抓取原网页并经证据核验。
-
-更完整的架构与数据流见 [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md)。
-
-Linux 服务器 Docker Compose 部署与 Windows 上传步骤见 [docs/DOCKER_DEPLOYMENT.md](./docs/DOCKER_DEPLOYMENT.md)。
-Docker Hub 公开镜像与固定版本见 [docs/DOCKER_HUB_RELEASE.md](./docs/DOCKER_HUB_RELEASE.md)。
-
----
-
-## 📂 目录结构
-
-```
-.
-├── frontend/              # React + Vite 前端
-│   ├── src/
-│   │   ├── components/    # 通用组件（VTracePanel / VDataGrid / VChart 等）
-│   │   ├── layout/        # AppLayout / VSidebar 全局框架
-│   │   ├── pages/         # 11 个页面（首页/工作台/报告/图谱/Trace/专家…）
-│   │   ├── store/         # Zustand 状态管理
-│   │   ├── lib/           # api.ts 等工具
-│   │   └── hooks/         # useTaskStream（SSE 订阅）
-│   └── tailwind.config.js # 设计 token 主题映射
-│
-├── backend/              # FastAPI + 多 Agent 编排后端（本地开发主目录）
-│   ├── app/
-│   │   ├── core/          # 编排 / LLM / 搜索 / 抓取 / 可信度 / Trace / 指标…
-│   │   ├── data/          # 48 专家定义 experts.json
-│   │   └── main.py        # FastAPI 入口
-│   └── requirements.txt
-│
-├── api/                  # Vercel Serverless 部署入口（后端代码的部署镜像，见下方说明）
-│   └── index.py
-│
-├── docs/                 # 架构 / Agent 协议 / 部署 / 设计方案文档
-├── vercel.json           # Vercel 部署配置
-├── restart.sh / stop.sh  # 本地一键启停脚本
-└── LICENSE               # AGPL-3.0
-```
-
-> **关于 `backend/` 与 `api/` 的代码重复**：
-> `backend/` 是本地开发与调试的主目录；`api/` 是为 [Vercel Serverless](https://vercel.com/docs/functions) 部署准备的镜像副本（Vercel 约定 Serverless 函数放在 `api/` 目录）。两者业务逻辑一致，部署时只使用 `api/`。详细说明与同步约定见 [docs/DEPLOYMENT.md](./docs/DEPLOYMENT.md)。
-
----
-
-## 🚀 快速开始
-
-### 环境要求
-
-- Node.js ≥ 22.12
-- Python ≥ 3.9
-
-### 1. 克隆并配置密钥
-
-```bash
-git clone <your-repo-url>
-cd verda
-
-# 配置后端密钥（绝不硬编码，全部走环境变量）
-cp backend/.env.example backend/.env
-# 编辑 backend/.env，选择 LLM_PROVIDER 并填入对应 Key；联网调研还需 BOCHA_API_KEY
-```
-
-### 2. 启动后端
-
-```bash
-cd backend
-python3 -m venv .venv
-.venv/bin/python -m pip install -r requirements.txt
-.venv/bin/python -m uvicorn app.main:app --reload --port 8010
-# 后端: http://localhost:8010   健康检查: /health   LLM 自检: /api/llm/ping
-```
-
-### 3. 启动前端
-
-```bash
-cd frontend
-npm install
-npm run dev
-# 前端: http://localhost:3400
-```
-
-Windows PowerShell 可在两个终端分别运行：
+建议使用 Python 3.11 与 Node.js 22。PowerShell 示例：
 
 ```powershell
-# 终端 1（backend/）
-python -m venv .venv
-.\.venv\Scripts\python.exe -X utf8 -m pip install -r requirements.txt
-.\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8010
-
-# 终端 2（frontend/）
-npm.cmd ci
-npm.cmd run dev
+Copy-Item backend/.env.example backend/.env
+python -m venv backend/.venv
+backend/.venv/Scripts/python.exe -m pip install -r requirements.txt 'uvicorn[standard]==0.32.1'
 ```
 
-`-X utf8` 可避免旧版 Windows pip 按 GBK 读取带中文注释的依赖文件失败。修改 `backend/.env` 后需要重启后端。`GET /health` 会显示当前 Provider，以及 LLM 和搜索密钥是否已配置；`GET /api/llm/config` 会显示生效的模型档位（不会返回密钥）。
+在 `backend/.env` 设置模型和搜索凭据后，分别启动两个终端：
 
-### 一键启停（可选）
-
-项目根目录提供了本地一键脚本（macOS / Linux）：
-
-```bash
-./restart.sh   # 清理旧进程 → 启动后端(:8010) → 等待就绪 → 启动前端(:3400)
-./stop.sh      # 按端口精确关闭本项目前后端
+```powershell
+Set-Location backend
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --reload --port 8010
 ```
 
----
-
-## 🔑 配置密钥
-
-复制 `backend/.env.example` 为 `backend/.env`，按需填写：
-
-| 变量 | 说明 | 必填 |
-|---|---|---|
-| `LLM_PROVIDER` | `deepseek`、`zhipu` 或 `custom`；未填写时使用 `deepseek` | 否 |
-| `DEEPSEEK_API_KEY` | 使用 DeepSeek 时的 API Key | DeepSeek 必填 |
-| `ZHIPU_API_KEY` | 使用智谱时的 API Key | 智谱必填 |
-| `LLM_API_KEY` / `LLM_BASE_URL` | 自定义 OpenAI 兼容接口的 Key 和网关；也可覆盖内置 Provider | custom 必填 |
-| `LLM_MODEL` / `LLM_MODEL_CORE` / `LLM_MODEL_AUX` / `LLM_MODEL_FAST` | 当前 Provider 的默认 / 核心章 / 辅助章 / 杂务模型 | custom 至少需填 `LLM_MODEL` |
-| `BOCHA_API_KEY` | 博查 Bocha Web Search Key，从 https://open.bocha.cn 获取（形如 `sk-xxxx`） | 真实联网采集时必填 |
-| `SEARCH_PROVIDERS` / `ANYSEARCH_API_KEY` | 可选搜索源列表与 AnySearch Key；如 `bocha,anysearch` | 否 |
-| `GROK_SEARCH_API_KEY` / `GROK_SEARCH_BASE_URL` / `GROK_SEARCH_MODEL` / `GROK_SEARCH_MODE` | Grok 查询规划或原生搜索配置；`planner` 用兼容聊天接口生成检索词，`native` 要求网关实际执行 Responses API 的 `web_search` | 否 |
-| `DOUYIN_COOKIE` / `BILIBILI_COOKIE` / `XHS_COOKIE` | 各平台舆情采集 cookie | 平台采集时按需 |
-| `APP_PORT` | 后端端口（默认 8000，本地脚本用 8010） | 否 |
-| `FRONTEND_ORIGIN` | 前端地址（CORS 白名单），默认 `http://localhost:3400` | 否 |
-
-DeepSeek 示例：`LLM_PROVIDER=deepseek`，在 `backend/.env` 填 `DEEPSEEK_API_KEY`。默认使用 `deepseek-flash`，核心章节使用 `deepseek-v4-pro`；本地调试时可设置 `LLM_MODEL_CORE=deepseek-flash`。真实搜索还需填写 `BOCHA_API_KEY`。
-
-设置 `SEARCH_PROVIDERS=bocha,anysearch,grok` 且 `GROK_SEARCH_MODE=planner` 后，社区维度每个品牌最多让 Grok 规划一次补充检索词，由 AnySearch 返回可抓取的来源 URL；其他查询不会额外消耗 Grok 调用。若网关实际支持服务端搜索，可改用 `GROK_SEARCH_MODE=native`。模型生成的文字不能直接作为证据。`GET /api/performance` 返回最近可访问报告的阶段 P50/P95、搜索与抓取耗时、Token、缓存命中及返工统计。搜索与正文缓存存于 SQLite，最多各 2000 条；TTL 根据时效与维度缩短，最长 7 天。
-
-当研究市场明确为海外/全球时，社区维度还会检索 X 帖子：`planner` 模式由 Grok 规划站内查询、AnySearch 找到帖子；`native` 模式优先使用真实的 xAI `x_search` 工具，失败时回退结构化搜索。X 帖子同样要取得正文后才能作为口碑证据，单条帖子不能代表全部用户。
-
-本机联调也可通过左下角「林研究员」打开「模型与搜索配置」，填写模型 Key 和博查 Key。先在未提交的 `backend/.env` 中设置 `LOCAL_SETTINGS_ENABLED=true`，并让前后端只监听本机地址。页面不会回显已保存的 Key；输入框留空表示保留原值。保存后立即应用于后续请求。云端部署始终禁用该写入接口。
-
-Docker 访客模式由 Compose 设置 `REQUIRE_CLIENT_API_KEYS=true`：服务器的 `backend/.env` 可以不填模型与博查 Key，站点仍会启动。每位访客在网页顶部提示栏自行填写 DeepSeek 与博查 Key，密钥长期保存在当前浏览器，请求调研时单独发送；服务器不会保存访客 Key。该模式需要同时更新后端与 Web 镜像，具体见 [访客 API Key 部署方案](./docs/BROWSER_API_KEYS_DEPLOYMENT.md)。
-
-验证 LLM 是否打通：
-
-```bash
-curl http://localhost:8010/api/llm/ping
+```powershell
+Set-Location frontend
+npm ci
+npm run dev
 ```
 
----
+前端默认位于 `http://localhost:3400`，开发代理将 `/api` 转到 `http://127.0.0.1:8010`。不要将 `.env` 或浏览器密钥提交到仓库。
 
-## 🔒 安全说明
+## 文档
 
-- **所有密钥仅通过环境变量读取，绝不硬编码在代码中**（见 [backend/app/core/config.py](./backend/app/core/config.py)）。
-- 本机配置弹窗把密钥写入被忽略的 `backend/.env`；接口只返回是否已填写，不返回密钥内容。
-- `.env` 及各类密钥文件已在 [.gitignore](./.gitignore) 中屏蔽，不会被提交。
-- 本地数据库 `*.db` / WAL / SHM、运行日志 `.run-logs/` 均不入库。
-- 提交代码前请再次确认：**没有任何真实的 API Key / Token / Cookie 被提交**。
-
----
-
-## 📖 文档
-
-| 文档 | 内容 |
+| 主题 | 文档 |
 |---|---|
-| [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) | 系统架构、模块划分、数据流、Deep Research 流水线 |
-| [来源治理与验收记录](./docs/SOURCE_GOVERNANCE_AND_EV_ACCEPTANCE.md) | 来源准入、转载聚类、最终审校、后台执行与真实案例验收 |
-| [新能源车示例报告](./doc/新能源车竞争格局分析.md) | 特斯拉、比亚迪、理想产品与定价竞争分析（附证据来源） |
-| [本地联调说明](./doc/联调验收说明.md) | 本地报告地址、截图、启动与重跑方式 |
-| [docs/AGENTS.md](./docs/AGENTS.md) | 48 专家分层、Agent 角色、消息协议、四条铁律 |
-| [docs/DEPLOYMENT.md](./docs/DEPLOYMENT.md) | 本地部署、Vercel 部署、backend/api 同步约定 |
-| [docs/系统升级实施方案.md](./docs/系统升级实施方案.md) | 完整设计与演进方案（含 AI 协作过程） |
-| [CONTRIBUTING.md](./CONTRIBUTING.md) | 贡献指南、提交规范、分支管理 |
+| 架构与数据流 | [架构](docs/ARCHITECTURE.md) |
+| 配置与部署 | [部署配置](docs/DEPLOYMENT.md) |
+| Plan、Replan 与限流 | [调研流程](docs/RESEARCH_WORKFLOW.md) |
+| Trace、Bad Case 与数据回流边界 | [可观测性与反馈](docs/TRACE_AND_FEEDBACK.md) |
+| 本次独立发布的文件范围 | [发布记录](docs/RELEASE_NOTES.md) |
+| 早期项目来源与许可 | [来源说明](docs/PROVENANCE.md) |
 
----
-
-## 🤝 贡献
-
-欢迎 Issue 与 PR。提交前请阅读 [CONTRIBUTING.md](./CONTRIBUTING.md)，遵循约定式提交（Conventional Commits）与代码风格规范。
-
-## 📄 许可证
-
-本项目采用 **[AGPL-3.0](./LICENSE)** 开源许可证。
-这意味着：你可以自由使用、修改、分发本项目，但**任何修改后的版本（包括通过网络提供服务的形式）都必须以相同的 AGPL-3.0 许可证开源**。
+本仓库采用 [AGPL-3.0](LICENSE)。
