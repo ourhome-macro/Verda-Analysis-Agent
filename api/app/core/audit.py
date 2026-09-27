@@ -11,7 +11,7 @@ from typing import Any, Dict, List
 
 from app.core.fetcher import domain_of
 from app.core.models import Envelope
-from app.core.research_contract import build_contract, build_matrix
+from app.core.research_contract import DIMENSIONS, build_contract, build_matrix
 from app.core.claim_verifier import supported_claims
 
 
@@ -194,6 +194,25 @@ def decide_rework(qr: QualityReport, review=None) -> List[Envelope]:
         if cell and not any(c["cell_id"] == cell["cell_id"] for c in cells):
             cells.append({**{k: cell[k] for k in ("cell_id", "brand", "dimension")},
                           "reason": str(item.get("reason", ""))[:400]})
+    if not cells and (review or {}).get("verdict") == "rework":
+        # A review verdict without cell IDs must not silently skip the feedback loop.
+        narrative = " ".join(str(x) for x in (review.get("issues") or []) +
+                             (review.get("suggestions") or [])).lower()
+        narrative += " " + str(review.get("review") or "").lower()
+        contract = qr.research_matrix.get("contract") or {}
+        dimensions = [d for d in contract.get("dimensions", [])
+                      if any(alias.lower() in narrative for alias in
+                             (d["label"], d["key"], *DIMENSIONS.get(d["key"], {}).get("aliases", ()))
+                             if len(alias) >= 2)]
+        brands = [b for b in contract.get("brands", []) if b.lower() in narrative]
+        candidates = [c for c in qr.research_matrix.get("cells", [])
+                      if (not dimensions or c["dimension"] in {d["key"] for d in dimensions})
+                      and (not brands or c["brand"] in brands)]
+        if not candidates:
+            candidates = qr.research_matrix.get("cells", [])
+        cells = [{**{k: c[k] for k in ("cell_id", "brand", "dimension")},
+                  "reason": "质检要求返工但未给单元，按审阅涉及的品牌和维度自动定位"}
+                 for c in candidates]
     if not cells:
         return []
     return [Envelope(msg_id="env_" + uuid.uuid4().hex[:8], sender="L3-003", receiver="collect",

@@ -254,7 +254,10 @@ class ClarifyBody(BaseModel):
 def post_clarify(task_id: str, body: ClarifyBody):
     if not db.get_task(task_id):
         raise HTTPException(status_code=404, detail="任务不存在")
-    return submit_clarify(task_id, body.answers)
+    try:
+        return submit_clarify(task_id, body.answers)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 # ── SSE 思维流 ──────────────────────────────────────────

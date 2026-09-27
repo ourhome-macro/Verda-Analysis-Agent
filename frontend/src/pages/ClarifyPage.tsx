@@ -34,6 +34,12 @@ export default function ClarifyPage() {
     setAnswers((a) => ({ ...a, [qid]: val }))
   }
   function toggleMulti(qid: string, val: string) {
+    const selected = (answers[qid] as string[]) ?? []
+    if (qid === 'competitors' && !selected.includes(val) && selected.length >= 5) {
+      setSubmitError('最多选择 5 个竞品；调研对象会自动加入')
+      return
+    }
+    setSubmitError('')
     setAnswers((a) => {
       const cur = (a[qid] as string[]) ?? []
       return {
@@ -48,6 +54,12 @@ export default function ClarifyPage() {
     if (!raw) return
     // 支持一次输入多个，用逗号/顿号/空格分隔
     const items = raw.split(/[,，、\s]+/).map((s) => s.trim()).filter(Boolean)
+    const selected = (answers[qid] as string[]) ?? []
+    if (qid === 'competitors' && new Set([...selected, ...items]).size > 5) {
+      setSubmitError('最多选择 5 个竞品；调研对象会自动加入')
+      return
+    }
+    setSubmitError('')
     setAnswers((a) => {
       const cur = (a[qid] as string[]) ?? []
       const merged = [...cur]

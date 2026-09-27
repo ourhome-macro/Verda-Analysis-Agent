@@ -35,6 +35,7 @@ from app.core.final_audit import finalize_report
 from app.core import task_runtime
 from app.core.research_contract import (VERSION as RESEARCH_VERSION, build_contract, build_matrix,
     dimension, cell_id, source_time, stamp_claim, section_fields, section_plan, merge_rework)
+from app.core.research_planner import initial_topics, revise_plan
 from app.core.audit import evaluate_quality, decide_rework, llm_quality_review
 from app.core.config import get_settings
 from app.core.credibility import score_evidence, freshness_days
@@ -104,18 +105,24 @@ def _model(tier: str) -> str:
 # ── 任务创建 / 澄清（落库）─────────────────────────────────
 def create_task(query: str, mode: str = "deep") -> Dict[str, Any]:
     task_id = _sid("t")
-    questions = _clarify_questions(query)
-    db.save_task(task_id, query, {"_mode": mode})
+    scope = _discover_scope(query)
+    questions = _clarify_questions(query, scope=scope)
+    db.save_task(task_id, query, {"_mode": mode, "_subject": scope.get("subject", ""),
+                                  "_category": scope.get("domain", "")})
     return {"taskId": task_id, "needClarify": True, "clarifyQuestions": questions}
 
 
 def submit_clarify(task_id: str, answers: Dict[str, Any]) -> Dict[str, Any]:
-    # 保留已存的 _mode
+    # 保留开题时识别的对象，除非用户明确否定该识别。
     task = db.get_task(task_id) or {}
     prev = task.get("clarifications", {}) or {}
+    competitors = answers.get("competitors") or []
+    if isinstance(competitors, list) and len({str(x).strip() for x in competitors if str(x).strip()}) > 5:
+        raise ValueError("最多选择 5 个竞品；调研对象会另外计入 6 品牌上限")
     merged = {**answers}
-    if "_mode" in prev and "_mode" not in merged:
-        merged["_mode"] = prev["_mode"]
+    for key in ("_mode", "_subject", "_category"):
+        if key in prev and key not in merged:
+            merged[key] = prev[key]
     db.update_task_clarify(task_id, merged)
     return {"ok": True}
 
@@ -179,7 +186,7 @@ def refine_section(report_id: str, section_id: str, annotations: List[str]) -> D
     return {"ok": False, "message": "refine failed"}
 
 
-def _clarify_questions(query: str) -> List[Dict[str, Any]]:
+def _clarify_questions(query: str, *, scope=None) -> List[Dict[str, Any]]:
     """LLM 先做「领域识别 + 竞品发现」，再生成澄清问卷。
 
     关键改进（解决「调研 Trae 结果只讲 Trae 不讲竞品」）：
@@ -187,7 +194,7 @@ def _clarify_questions(query: str) -> List[Dict[str, Any]]:
     - 自动发现尽可能多的候选竞品，作为多选项让用户在问卷里勾选确认；
     - 仍保留维度/市场/用户/时间/视角等澄清问题。
     """
-    scope = _discover_scope(query)
+    scope = scope if scope is not None else _discover_scope(query)
     subject = scope.get("subject") or query
     domain = scope.get("domain") or ""
     competitors = scope.get("competitors") or []
@@ -209,7 +216,7 @@ def _clarify_questions(query: str) -> List[Dict[str, Any]]:
             "question": f"为「{subject}」自动发现了以下候选竞品，请勾选你希望重点对比的对象（可多选）：",
             "type": "multi",
             "options": competitors[:12],
-            "hint": "勾选后我们会确保每个竞品都被充分调研；如有遗漏可在最后一题补充。",
+            "hint": "最多选 5 个竞品，调研对象会自动加入；如有遗漏可自行补充。",
         })
 
     # 2-6) 维度 / 市场 / 用户 / 时间 / 视角 / 补充
@@ -277,6 +284,8 @@ def _plan_research(query: str, clar: Dict[str, Any], max_angles: int = 7) -> Dic
     if isinstance(user_brands, str):
         user_brands = [user_brands]
     user_brands = [str(b).strip() for b in user_brands if str(b).strip()]
+    confirmed_subject = ("" if str(clar.get("scope", "")).startswith("不准确")
+                         else str(clar.get("_subject") or "").strip())
     try:
         data = chat_json(
             [
@@ -286,7 +295,8 @@ def _plan_research(query: str, clar: Dict[str, Any], max_angles: int = 7) -> Dic
                     '"category":"该对象所属的细分品类/领域（用于消歧，如 AI编程工具、知识管理软件、新能源汽车）",'
                     '"brands":["竞品全称1","竞品全称2"],'
                     '"focus":["本次重点维度，如 定价/功能/口碑"],'
-                    '"search_angles":["针对每个竞品的搜索角度短语，如 产品功能、定价方案、用户评测、技术文档、财报营收"]}。'
+                    '"search_angles":["搜索角度短语"],'
+                    '"search_plan":[{"dimension":"用户指定维度","query":"对应维度的具体检索词"}]}。'
                     "brands 必须是真实可搜索的产品/公司名，且【必须同时包含调研对象本身与它的主要竞品】（3-6 个），"
                     "确保对比维度完整，绝不能只调研对象自身而忽略竞品。"
                     "category 要给一个能精准消歧的品类短语（避免品牌名歧义，如 Trae 应识别为「AI编程工具/AI代码编辑器」）。"
@@ -304,36 +314,44 @@ def _plan_research(query: str, clar: Dict[str, Any], max_angles: int = 7) -> Dic
         )
         if isinstance(data, dict) and (data.get("brands") or user_brands):
             llm_brands = [b for b in (data.get("brands") or []) if isinstance(b, str) and b.strip()]
-            subject = str(data.get("subject") or "").strip()
+            subject = confirmed_subject or str(data.get("subject") or "").strip()
             # subject 仅当像「单个产品名」才作为品牌纳入：排除对比短语/过长描述
             # （如「Notion与Obsidian的对比分析」不能当成一个品牌）
-            subject_ok = bool(subject) and len(subject) <= 16 and not any(
+            subject_ok = bool(subject) and len(subject) <= 80 and not any(
                 k in subject for k in ("对比", "竞争", "分析", "调研", "格局", "与", "和", "、", "vs", "VS", "/")
             )
-            # 合并：用户勾选优先 → （合格的）调研对象 → LLM 拆出的竞品；去重保序，上限 6
+            # 调研对象必须进入矩阵；其后保留用户勾选，再补足模型发现的竞品。
             merged: List[str] = []
-            for b in user_brands + ([subject] if subject_ok else []) + llm_brands:
+            for b in ([subject] if subject_ok else []) + user_brands + llm_brands:
                 b = b.strip()
                 if b and b not in merged:
                     merged.append(b)
-            brands = (user_brands or merged)[:6]
+            brands = merged[:6]
             angles = [a for a in data.get("search_angles", []) if isinstance(a, str)][:max_angles]
             focus = [f for f in (clar.get("focus") or data.get("focus", [])) if isinstance(f, str)]
             category = str(data.get("category") or "").strip()
             if brands:
                 return {
+                    "subject": subject if subject_ok else "",
                     "brands": brands,
                     "focus": focus or ["产品", "定价", "口碑"],
                     "angles": angles or ["产品功能", "定价方案", "用户评测", "最新动态", "市场份额"],
+                    "search_plan": data.get("search_plan") if isinstance(data.get("search_plan"), list) else [],
+                    "omitted_brands": merged[6:],
                     "category": category,
                 }
     except Exception:
         pass
-    fallback_brands = user_brands or _regex_brands(query)
+    inferred = _regex_brands(query)
+    fallback_brands = list(dict.fromkeys(([confirmed_subject] if confirmed_subject else inferred[:1])
+                                         + user_brands + inferred))
     return {
+        "subject": fallback_brands[0] if fallback_brands else "",
         "brands": fallback_brands[:6],
         "focus": clar.get("focus") or ["产品", "定价", "口碑"],
         "angles": ["产品功能", "定价方案", "用户评测", "最新动态", "市场份额"][:max_angles],
+        "search_plan": [],
+        "omitted_brands": fallback_brands[6:],
         "category": str((clar.get("_category") or "")).strip(),
     }
 
@@ -507,23 +525,27 @@ def _overseas_market(market: str) -> bool:
 
 def _collect_brand(brand: str, angles: List[str], collector: str,
                    fetch_limit: int, freshness: str,
-                   existing_urls: set, contract=None, dimensions=None) -> Dict[str, Any]:
+                   existing_urls: set, contract=None, dimensions=None,
+                   search_topics=None) -> Dict[str, Any]:
     """Each requested dimension receives its own retrieval and fetch budget."""
     contract = contract or build_contract([brand], angles or ["功能对比", "定价策略"])
     dimensions = dimensions or contract["dimensions"]
+    resolved_topics = search_topics or initial_topics({"angles": angles}, contract)
     out_ev, out_img, found = [], [], 0
     page_cache, diagnostics = {}, []
     source_profile = profile(brand)
     per_cell = max(3, min(5, (fetch_limit + len(dimensions) - 1) // max(1, len(dimensions))))
     for dim in dimensions:
         key, source = dim["key"], dim["source"]
-        topic = dim["query"]
+        topic = resolved_topics.get(key) or dim["query"]
         if contract["industry"] == "automotive":
-            topic = {"feature_tree": "当前车型 配置 续航 动力",
-                     "pricing_model": "当前在售车型 整车指导价 版本 地区"}.get(key, topic)
+            auto_topic = {"feature_tree": "当前车型 配置 续航 动力",
+                          "pricing_model": "当前在售车型 整车指导价 版本 地区"}.get(key)
+            if auto_topic:
+                topic = f"{auto_topic} {topic}" if topic != dim["query"] else auto_topic
         queries = [f"{brand} {topic}"]
         if source == "community":
-            queries = [f"{brand} {contract['market']} {contract['user']} 使用体验 评价",
+            queries = [f"{brand} {topic} {contract['market']} {contract['user']} 使用体验 评价",
                        f"{brand} 社区 讨论 缺点"]
         recent = multi_search(queries, num=5, freshness=freshness, source_kind=source,
                               use_grok=(source == "community" and
@@ -672,10 +694,20 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
     focus = plan["focus"]
     angles = plan["angles"]
     contract = build_contract(brands, focus, clar, query)
+    search_topics = initial_topics(plan, contract)
+    plan_revisions = []
     contract["overseas_social"] = (_overseas_market(contract.get("market", ""))
                                    or _overseas_market(query))
     cfg["freshness"] = contract["freshness"]
     yield _ev("message", {"id": _sid("m"), "kind": "research_contract", "contract": contract})
+    yield _ev("message", {"id": _sid("m"), "kind": "research_plan",
+                          "version": 1, "brands": brands, "focus": focus,
+                          "search_angles": angles, "search_topics": search_topics,
+                          "omitted_brands": plan.get("omitted_brands", [])})
+    if plan.get("omitted_brands"):
+        yield _ev("thought", {"id": _sid("th"), "kind": "plan", "expert": "L3-001",
+                              "text": "本次最多研究 6 个品牌，未纳入：" + "、".join(plan["omitted_brands"]),
+                              "ts": _now()})
     yield _ev("thought", {"id": _sid("th"), "kind": "plan", "expert": "L3-001",
                           "text": f"锁定竞品：{'、'.join(brands)}；重点维度：{'、'.join(focus)}；"
                                   f"将从「{'、'.join(angles)}」等角度展开多轮联网检索。", "ts": _now()})
@@ -740,7 +772,8 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
                             if sum(d["key"] in e.research_dimensions for e in cached) < 3]
             result = (await asyncio.to_thread(_collect_brand, brand, angles, collector,
                                               cfg["fetch_per_brand"], cfg["freshness"],
-                                              local_seen, contract, missing_dims)
+                                              local_seen, contract, missing_dims,
+                                              search_topics=search_topics)
                       if missing_dims else {"evidences": [], "images": [], "found": 0})
             result["evidences"] = cached + result["evidences"]
             return brand, result
@@ -861,13 +894,20 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
     quality_after = quality_before
     review_after = review_before
     envelopes = decide_rework(quality_after, review_after)
-    for _ in range(cfg["rework_rounds"]):
+    for round_number in range(1, min(2, max(0, cfg["rework_rounds"])) + 1):
         if not envelopes:
             break
         yield _ev("node_update", {"node": "audit", "status": "rework"})
-        feedback = [i["reason"] for i in quality_after.issues]
-        feedback += [str(x) for x in review_after.get("issues", [])[:5]]
-        feedback += [str(x) for x in review_after.get("suggestions", [])[:5]]
+        targets_for_plan = [c for env in envelopes for c in env.payload.get("cells", [])]
+        revision = revise_plan(contract, structured["research_matrix"], targets_for_plan,
+                               search_topics, review_after, round_number)
+        plan_revisions.append(revision)
+        yield _ev("message", {"id": _sid("m"), "kind": "replan", "plan": revision})
+        trace.record_manual_span(task_id, auditor, "replan", f"第 {round_number} 轮定向重规划",
+                                 detail=f"版本 {revision['version']}；目标 {len(revision['targets'])} 格",
+                                 decision=revision["reason"])
+        for e in _drain_trace():
+            yield e
         new_evidence_ids = []
         for env in envelopes:
             yield _ev("message", {"id": _sid("m"), "kind": "rework", "expert": auditor,
@@ -884,7 +924,9 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
                     continue
                 trace.set_context(task_id, collector, "collect", f"返工补采「{b}/{dims[0]['label']}」")
                 res = await asyncio.to_thread(_collect_brand, b, [dims[0]["query"]], collector,
-                                              4, cfg["freshness"], seen_urls, contract, dims)
+                                              4, cfg["freshness"], seen_urls, contract, dims,
+                                              search_topics={dims[0]["key"]: revision["search_topics"].get(
+                                                  target["cell_id"], search_topics.get(dims[0]["key"], dims[0]["query"]))})
                 collection_diagnostics.extend({**d, "round": rework_rounds_done + 1} for d in res.get("diagnostics", []))
                 for ev in res["evidences"]:
                     evidences.append(ev)
@@ -1037,6 +1079,12 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
                               "issues_resolved": issues_resolved}
     report["quality_status"] = quality_status
     report["research_matrix"] = structured["research_matrix"]
+    report["research_plan"] = {"version": 1, "subject": plan.get("subject", ""),
+                               "brands": brands, "focus": focus, "category": plan.get("category", ""),
+                               "search_angles": angles, "search_topics": search_topics,
+                               "omitted_brands": plan.get("omitted_brands", []),
+                               "contract_version": contract["version"]}
+    report["plan_revisions"] = plan_revisions
     report["collection_diagnostics"] = collection_diagnostics
     report["analysis_diagnostics"] = analysis_diagnostics
     report["source_governance"] = {
