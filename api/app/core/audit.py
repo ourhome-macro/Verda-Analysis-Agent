@@ -209,11 +209,12 @@ def decide_rework(qr: QualityReport, review=None) -> List[Envelope]:
         candidates = [c for c in qr.research_matrix.get("cells", [])
                       if (not dimensions or c["dimension"] in {d["key"] for d in dimensions})
                       and (not brands or c["brand"] in brands)]
-        if not candidates:
-            candidates = qr.research_matrix.get("cells", [])
-        cells = [{**{k: c[k] for k in ("cell_id", "brand", "dimension")},
-                  "reason": "质检要求返工但未给单元，按审阅涉及的品牌和维度自动定位"}
-                 for c in candidates]
+        # Only an unambiguous location can spend research budget. A vague
+        # verdict across many cells is surfaced for review by the caller.
+        if len(candidates) == 1:
+            c = candidates[0]
+            cells = [{**{k: c[k] for k in ("cell_id", "brand", "dimension")},
+                      "reason": "质检未给单元，审阅内容唯一定位到此品牌和维度"}]
     if not cells:
         return []
     return [Envelope(msg_id="env_" + uuid.uuid4().hex[:8], sender="L3-003", receiver="collect",

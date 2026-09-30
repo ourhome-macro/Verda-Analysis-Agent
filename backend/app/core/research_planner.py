@@ -10,6 +10,7 @@ from app.core.research_contract import cell_id, field_for
 
 MAX_REPLAN_ROUNDS = 2
 MAX_ACTIONS_PER_ROUND = 24
+MAX_TOTAL_ACTIONS = 36
 MAX_FETCH_PAGES_PER_ACTION = 4
 ACTION_KINDS = frozenset({"search_alternate_source", "search_dated_official",
                           "refetch_reverify", "stop_ask_user"})
@@ -89,8 +90,12 @@ def revise_plan(contract: dict, matrix: dict, cells: list[dict],
                    for cid in by_cell}
     ordered_cells = sorted(cells, key=lambda row: prior_count.get(row.get("cell_id"), 0)
                            if isinstance(row, dict) else 0)
+    remaining = MAX_TOTAL_ACTIONS - len(previous_actions or [])
+    if remaining <= 0:
+        raise ValueError("replan total action budget exhausted")
+    round_limit = min(MAX_ACTIONS_PER_ROUND, remaining)
     for target in ordered_cells:
-        if len(actions) >= MAX_ACTIONS_PER_ROUND:
+        if len(actions) >= round_limit:
             if (isinstance(target, dict) and target.get("cell_id") in by_cell
                     and (target.get("brand"), target.get("dimension")) ==
                     (by_cell[target["cell_id"]]["brand"], by_cell[target["cell_id"]]["dimension"])):
@@ -152,12 +157,16 @@ def revise_plan(contract: dict, matrix: dict, cells: list[dict],
              "edges": [{"from": a["action_id"], "to": f"verify:{a['cell_id']}"}
                        for a in actions if a["kind"] != "stop_ask_user"],
              "budget": {"max_rounds": MAX_REPLAN_ROUNDS, "max_actions": MAX_ACTIONS_PER_ROUND,
+                        "max_total_actions": MAX_TOTAL_ACTIONS,
                         "max_fetch_pages_per_action": MAX_FETCH_PAGES_PER_ACTION}}
-    validate_plan_delta(delta, contract, matrix, evidences=evidences)
+    validate_plan_delta(delta, contract, matrix, evidences=evidences,
+                        previous_actions=previous_actions)
     return delta
 
 
-def validate_plan_delta(delta: dict, contract: dict, matrix: dict, *, evidences: list | None = None) -> None:
+def validate_plan_delta(delta: dict, contract: dict, matrix: dict, *,
+                        evidences: list | None = None,
+                        previous_actions: list[dict] | None = None) -> None:
     """Reject changed scope, time, URL, action or budget before execution."""
     if delta.get("contract_version") != contract.get("version") or delta.get("as_of") != contract.get("as_of"):
         raise ValueError("PlanDelta changed research contract")
@@ -171,8 +180,11 @@ def validate_plan_delta(delta: dict, contract: dict, matrix: dict, *, evidences:
     actions = delta.get("actions")
     if not isinstance(actions, list) or len(actions) > MAX_ACTIONS_PER_ROUND:
         raise ValueError("PlanDelta action budget exceeded")
+    if len(actions) + len(previous_actions or []) > MAX_TOTAL_ACTIONS:
+        raise ValueError("PlanDelta total action budget exceeded")
     if delta.get("budget") != {"max_rounds": MAX_REPLAN_ROUNDS,
                                "max_actions": MAX_ACTIONS_PER_ROUND,
+                               "max_total_actions": MAX_TOTAL_ACTIONS,
                                "max_fetch_pages_per_action": MAX_FETCH_PAGES_PER_ACTION}:
         raise ValueError("PlanDelta changed hard budgets")
     allowed = {c["cell_id"]: c for c in matrix.get("cells", [])}

@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import time
 import zlib
 from contextlib import suppress
@@ -19,6 +20,11 @@ from app.core.config import use_request_settings
 _workers = {}
 LEASE_SECONDS = 45
 STAGE_SNAPSHOT_TTL_SECONDS = 3600
+log = logging.getLogger("uvicorn.error")
+
+
+class RunLeaseLost(RuntimeError):
+    """The task attempt is no longer the active leased writer."""
 
 
 def init():
@@ -99,8 +105,11 @@ def state(task_id):
         c = db._connect()
         row = c.execute("SELECT * FROM research_runs WHERE task_id=?", (task_id,)).fetchone()
         if row and row["status"] == "running" and row["lease_until"] < time.time():
-            c.execute("UPDATE research_runs SET status='interrupted' WHERE task_id=? AND lease_until<?",
-                      (task_id, time.time()))
+            published = c.execute("SELECT report_id FROM tasks WHERE task_id=? AND status='done'",
+                                  (task_id,)).fetchone()
+            c.execute("UPDATE research_runs SET status=? WHERE task_id=? AND lease_until<?",
+                      ("done" if published and published["report_id"] else "interrupted",
+                       task_id, time.time()))
             c.commit()
             row = c.execute("SELECT * FROM research_runs WHERE task_id=?", (task_id,)).fetchone()
         return dict(row) if row else None
@@ -147,13 +156,25 @@ def collection_checkpoint(task_id):
     return list(pool.values())
 
 
-def append_event(task_id, attempt, event):
+def append_event(task_id, attempt, event, *, require_active=False):
     with db._LOCK:
         c = db._connect()
-        c.execute("INSERT INTO research_events(task_id,seq,attempt,event_type,data) "
-                  "SELECT ?,COALESCE(MAX(seq),0)+1,?,?,? FROM research_events WHERE task_id=?",
-                  (task_id, attempt, event["type"], json.dumps(event["data"], ensure_ascii=False), task_id))
-        c.commit()
+        if require_active:
+            c.execute("BEGIN IMMEDIATE")
+        try:
+            if require_active:
+                row = c.execute("SELECT attempt,status,lease_until FROM research_runs WHERE task_id=?",
+                                (task_id,)).fetchone()
+                if (not row or row["attempt"] != attempt or row["status"] != "running"
+                        or row["lease_until"] <= time.time()):
+                    raise RunLeaseLost("research run lease is absent or expired")
+            c.execute("INSERT INTO research_events(task_id,seq,attempt,event_type,data) "
+                      "SELECT ?,COALESCE(MAX(seq),0)+1,?,?,? FROM research_events WHERE task_id=?",
+                      (task_id, attempt, event["type"], json.dumps(event["data"], ensure_ascii=False), task_id))
+            c.commit()
+        except BaseException:
+            c.rollback()
+            raise
 
 
 def events(task_id, after=0):
@@ -192,14 +213,26 @@ async def start(task_id, visitor_id, settings, pipeline, *, sub_id="", retry=Fal
 
 
 async def _run(task_id, attempt, visitor_id, settings, pipeline, sub_id):
+    owner = asyncio.current_task()
     async def heartbeat():
-        while True:
-            await asyncio.sleep(10)
-            with db._LOCK:
-                c = db._connect()
-                c.execute("UPDATE research_runs SET lease_until=? WHERE task_id=? AND attempt=? AND status='running'",
-                          (time.time() + LEASE_SECONDS, task_id, attempt))
-                c.commit()
+        try:
+            while True:
+                await asyncio.sleep(10)
+                with db._LOCK:
+                    c = db._connect()
+                    now = time.time()
+                    changed = c.execute("UPDATE research_runs SET lease_until=? WHERE task_id=? "
+                                        "AND attempt=? AND status='running' AND lease_until>?",
+                                        (now + LEASE_SECONDS, task_id, attempt, now)).rowcount
+                    c.commit()
+                if changed != 1:
+                    raise RunLeaseLost("heartbeat lost the research run lease")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("research_run_lease_lost task_id=%s attempt=%d", task_id, attempt)
+            if owner is not None:
+                owner.cancel()
     beat = asyncio.create_task(heartbeat())
     status = "failed"
     try:
@@ -209,7 +242,7 @@ async def _run(task_id, attempt, visitor_id, settings, pipeline, sub_id):
             async for event in pipeline(task_id, sub_id=sub_id):
                 if event["type"] == "node_update":
                     performance.on_node_update(task_id, event["data"])
-                append_event(task_id, attempt, event)
+                append_event(task_id, attempt, event, require_active=True)
                 if event["type"] == "done":
                     status = "done"
             if status != "done":
@@ -224,23 +257,31 @@ async def _run(task_id, attempt, visitor_id, settings, pipeline, sub_id):
         beat.cancel()
         with suppress(asyncio.CancelledError):
             await beat
-        try:
-            db.save_attempt_performance(task_id, attempt, status,
-                                        performance.snapshot(task_id))
-        except Exception:
-            pass  # Metrics must never prevent task state cleanup.
         with db._LOCK:
             c = db._connect()
-            c.execute("UPDATE research_runs SET status=?,updated_at=? WHERE task_id=? AND attempt=?",
-                      (status, time.time(), task_id, attempt))
-            if status == "done":
-                c.execute("DELETE FROM research_stage_snapshots WHERE task_id=?", (task_id,))
-            else:
-                c.execute("UPDATE tasks SET status=? WHERE task_id=?", (status, task_id))
-            c.commit()
-        trace.cleanup(task_id)
-        performance.cleanup(task_id)
-        _workers.pop(task_id, None)
+            current = c.execute("SELECT attempt FROM research_runs WHERE task_id=?", (task_id,)).fetchone()
+            owns_run = bool(current and current["attempt"] == attempt)
+            if owns_run:
+                published = c.execute("SELECT report_id FROM tasks WHERE task_id=? AND status='done'",
+                                      (task_id,)).fetchone()
+                if published and published["report_id"]:
+                    status = "done"
+                c.execute("UPDATE research_runs SET status=?,updated_at=? WHERE task_id=? AND attempt=?",
+                          (status, time.time(), task_id, attempt))
+                if status == "done":
+                    c.execute("DELETE FROM research_stage_snapshots WHERE task_id=?", (task_id,))
+                else:
+                    c.execute("UPDATE tasks SET status=? WHERE task_id=?", (status, task_id))
+                c.commit()
+                try:
+                    db.save_attempt_performance(task_id, attempt, status,
+                                                performance.snapshot(task_id))
+                except Exception:
+                    pass  # Metrics must never prevent task state cleanup.
+                trace.cleanup(task_id)
+                performance.cleanup(task_id)
+            if _workers.get(task_id) is owner:
+                _workers.pop(task_id, None)
 
 
 async def observe(task_id, request, *, after=0):

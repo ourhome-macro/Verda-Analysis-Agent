@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import datetime as _dt
+import hashlib
 import json
 import os
 import sqlite3
@@ -358,45 +359,97 @@ def mark_task_done(task_id: str, report_id: str) -> None:
 
 # ── 报告 + 证据 ─────────────────────────────────────────
 def save_report(report: Dict[str, Any], task_id: str = "") -> None:
+    with _LOCK:
+        c = _connect()
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            if task_id and not _owned(c, "task", task_id):
+                raise PermissionError("Task is not accessible")
+            _write_report_snapshot(c, report, task_id)
+            c.commit()
+        except BaseException:
+            c.rollback()
+            raise
+
+
+def _write_report_snapshot(c: sqlite3.Connection, report: Dict[str, Any], task_id: str) -> None:
     evidence = report.get("evidence", [])
     claims = report.get("claims", [])
     high = sum(1 for c in claims if c.get("confidence") == "high")
-    with _LOCK:
-        c = _connect()
-        if task_id and not _owned(c, "task", task_id):
-            raise PermissionError("Task is not accessible")
-        _remember_owner(c, "report", report["id"])
+    _remember_owner(c, "report", report["id"])
+    c.execute(
+        "INSERT OR REPLACE INTO reports(report_id,task_id,title,subtitle,query,brands,experts,"
+        "cover_image,data,evidence_count,claim_count,high_conf_count,created_at)"
+        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            report["id"], task_id, report.get("title", ""), report.get("subtitle", ""),
+            report.get("query", ""), json.dumps(report.get("brands", []), ensure_ascii=False),
+            json.dumps(report.get("experts", []), ensure_ascii=False),
+            report.get("cover_image", ""), json.dumps(report, ensure_ascii=False),
+            len(evidence), len(claims), high, report.get("created_at", _now()),
+        ),
+    )
+    # Snapshot rows belong to this report; repeated report saves replace
+    # its own snapshot without disturbing any other report.
+    c.execute("DELETE FROM evidences WHERE report_id=?", (report["id"],))
+    for ev in evidence:
+        if not ev.get("evidence_id"):
+            continue
         c.execute(
-            "INSERT OR REPLACE INTO reports(report_id,task_id,title,subtitle,query,brands,experts,"
-            "cover_image,data,evidence_count,claim_count,high_conf_count,created_at)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO evidences(evidence_id,report_id,source_url,source_type,"
+            "domain,title,excerpt,credibility,collected_by,brand,captured_at)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
             (
-                report["id"], task_id, report.get("title", ""), report.get("subtitle", ""),
-                report.get("query", ""), json.dumps(report.get("brands", []), ensure_ascii=False),
-                json.dumps(report.get("experts", []), ensure_ascii=False),
-                report.get("cover_image", ""), json.dumps(report, ensure_ascii=False),
-                len(evidence), len(claims), high, report.get("created_at", _now()),
+                ev.get("evidence_id"), report["id"], ev.get("source_url", ""),
+                ev.get("source_type", ""), ev.get("domain", ""), ev.get("title", ""),
+                ev.get("excerpt", "")[:500], ev.get("credibility", 0.0),
+                ev.get("collected_by", ""), ev.get("brand", ""), ev.get("captured_at", _now()),
             ),
         )
-        # Snapshot rows belong to this report; repeated report saves replace
-        # its own snapshot without disturbing any other report.
-        c.execute("DELETE FROM evidences WHERE report_id=?", (report["id"],))
-        # 证据溯源单独入库，供全局证据库检索
-        for ev in evidence:
-            if not ev.get("evidence_id"):
-                continue
-            c.execute(
-                "INSERT INTO evidences(evidence_id,report_id,source_url,source_type,"
-                "domain,title,excerpt,credibility,collected_by,brand,captured_at)"
-                " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                (
-                    ev.get("evidence_id"), report["id"], ev.get("source_url", ""),
-                    ev.get("source_type", ""), ev.get("domain", ""), ev.get("title", ""),
-                    ev.get("excerpt", "")[:500], ev.get("credibility", 0.0),
-                    ev.get("collected_by", ""), ev.get("brand", ""), ev.get("captured_at", _now()),
-                ),
-            )
-        c.commit()
+
+
+def publish_report_atomic(report: Dict[str, Any], task_id: str, attempt: int,
+                          spans: List[Dict[str, Any]], artifact_payload: Dict[str, Any],
+                          author: str) -> None:
+    """Fence the run and publish report, index, trace and task status together."""
+    if type(attempt) is not int or attempt < 1 or not task_id or not author:
+        raise ValueError("valid task, attempt and author are required")
+    report_id = report.get("id")
+    if not isinstance(report_id, str) or not report_id:
+        raise ValueError("report ID is required")
+    encoded = json.dumps(artifact_payload, ensure_ascii=False, sort_keys=True,
+                         separators=(",", ":"), allow_nan=False)
+    if len(encoded.encode("utf-8")) > 2_000_000:
+        raise ValueError("report artifact exceeds 2 MB")
+    with _LOCK:
+        c = _connect()
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            if not _owned(c, "task", task_id):
+                raise PermissionError("Task is not accessible")
+            run = c.execute("SELECT attempt,status,lease_until FROM research_runs WHERE task_id=?",
+                            (task_id,)).fetchone()
+            if (not run or run["attempt"] != attempt or run["status"] != "running"
+                    or run["lease_until"] <= time.time()):
+                raise PermissionError("research run lease is absent or expired")
+            if c.execute("SELECT 1 FROM reports WHERE report_id=?", (report_id,)).fetchone():
+                raise ValueError("report ID already exists")
+            _write_report_snapshot(c, report, task_id)
+            c.execute("""INSERT INTO artifact_versions
+                (task_id,attempt,cell_id,kind,artifact_id,version,author,payload,
+                 content_sha256,source_group,source_offsets,created_at)
+                VALUES(?,?,?,'Report',?,1,?,?,?,'','{}',?)""",
+                (task_id, attempt, "report", report_id, author, encoded,
+                 hashlib.sha256(encoded.encode("utf-8")).hexdigest(), _now()))
+            _write_traces(c, task_id, report_id, spans)
+            changed = c.execute("UPDATE tasks SET status='done',report_id=? WHERE task_id=?",
+                                (report_id, task_id)).rowcount
+            if changed != 1:
+                raise LookupError("task disappeared during report publication")
+            c.commit()
+        except BaseException:
+            c.rollback()
+            raise
 
 
 def get_report(report_id: str) -> Optional[Dict[str, Any]]:
@@ -776,23 +829,28 @@ def save_traces(task_id: str, report_id: str, spans: List[Dict[str, Any]]) -> No
         c = _connect()
         if not _owned(c, "task", task_id):
             raise PermissionError("Task is not accessible")
-        for s in spans:
-            c.execute(
-                "INSERT OR REPLACE INTO traces(span_id,task_id,report_id,seq,agent_id,stage,"
-                "purpose,model,prompt,response,prompt_tokens,completion_tokens,total_tokens,"
-                "latency_ms,decision,evidence_ids,ts) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (
-                    s.get("span_id"), task_id, report_id, s.get("seq", 0),
-                    s.get("agent_id", ""), s.get("stage", ""), s.get("purpose", ""),
-                    s.get("model", ""), (s.get("prompt", "") or "")[:2000],
-                    (s.get("response", "") or "")[:2000],
-                    s.get("prompt_tokens", 0), s.get("completion_tokens", 0),
-                    s.get("total_tokens", 0), s.get("latency_ms", 0),
-                    s.get("decision", ""), json.dumps(s.get("evidence_ids", []), ensure_ascii=False),
-                    s.get("ts", _now()),
-                ),
-            )
+        _write_traces(c, task_id, report_id, spans)
         c.commit()
+
+
+def _write_traces(c: sqlite3.Connection, task_id: str, report_id: str,
+                  spans: List[Dict[str, Any]]) -> None:
+    for s in spans:
+        c.execute(
+            "INSERT OR REPLACE INTO traces(span_id,task_id,report_id,seq,agent_id,stage,"
+            "purpose,model,prompt,response,prompt_tokens,completion_tokens,total_tokens,"
+            "latency_ms,decision,evidence_ids,ts) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                s.get("span_id"), task_id, report_id, s.get("seq", 0),
+                s.get("agent_id", ""), s.get("stage", ""), s.get("purpose", ""),
+                s.get("model", ""), (s.get("prompt", "") or "")[:2000],
+                (s.get("response", "") or "")[:2000],
+                s.get("prompt_tokens", 0), s.get("completion_tokens", 0),
+                s.get("total_tokens", 0), s.get("latency_ms", 0),
+                s.get("decision", ""), json.dumps(s.get("evidence_ids", []), ensure_ascii=False),
+                s.get("ts", _now()),
+            ),
+        )
 
 
 def get_traces_by_task(task_id: str) -> List[Dict[str, Any]]:

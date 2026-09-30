@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import datetime as _dt
 import json
+import logging
 import re
 import time
 import uuid
@@ -1213,6 +1214,17 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
             yield e
         envelopes = decide_rework(quality_after, review_after)
 
+    if review_after.get("verdict") == "rework" and not envelopes:
+        reason = "质检要求返工但未能唯一定位品牌与维度；请明确问题或提供原始来源"
+        replan_stop_reasons.append({"cell_id": "", "reason": reason})
+        yield _ev("message", {"id": _sid("m"), "kind": "replan_stop",
+                              "cell_id": "", "reason": reason,
+                              "requires_user_input": True})
+        trace.record_manual_span(task_id, auditor, "replan", "模糊质检意见停止返工",
+                                 decision=reason)
+        for e in _drain_trace():
+            yield e
+
     # Exhaustion is an explicit graph stop. The user can supply a primary
     # source or change the scope in a new task; this run never mutates it.
     if cfg["rework_rounds"] and envelopes:
@@ -1364,11 +1376,10 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
         report["performance"].get("tokens", {}).get(k, 0) for k in ("input", "output"))
     if attempt is not None:
         report["task_board"] = {"attempt": attempt, **task_board.summary(task_id, attempt)}
-    db.save_report(report, task_id=task_id)
+    matrix = report.get("research_matrix") or {}
     if attempt is not None:
-        matrix = report.get("research_matrix") or {}
-        artifact_store.publish_artifact(
-            task_id, attempt, "report", "Report", report["id"],
+        db.publish_report_atomic(
+            report, task_id, attempt, trace_spans,
             {"report_id": report["id"], "quality_status": report["quality_status"],
              "fact_covered": matrix.get("fact_covered", 0),
              "freshness_covered": matrix.get("covered", 0),
@@ -1376,12 +1387,18 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
              "evidence_ids": [e["evidence_id"] for e in report.get("evidence", [])],
              "claim_ids": [c["claim_id"] for c in report.get("claims", [])]},
             author=dispatch["lead"])
-    db.save_traces(task_id, report["id"], trace_spans)
-    db.mark_task_done(task_id, report["id"])
+    else:
+        # Direct offline calls do not have a leased runtime attempt.
+        db.save_report(report, task_id=task_id)
+        db.save_traces(task_id, report["id"], trace_spans)
+        db.mark_task_done(task_id, report["id"])
     claims_by_author = Counter(c.get("author", "") for c in claims if c.get("author"))
-    db.bump_expert_stats(member_ids, dict(claims_by_author), dict(ev_by_collector))
-    if sub_id:
-        db.mark_subscription_run(sub_id, report["id"])
+    try:
+        db.bump_expert_stats(member_ids, dict(claims_by_author), dict(ev_by_collector))
+        if sub_id:
+            db.mark_subscription_run(sub_id, report["id"])
+    except Exception:
+        logging.getLogger("uvicorn.error").exception("report_post_publish_stats_failed task_id=%s", task_id)
     trace.cleanup(task_id)
 
     yield _ev("progress", prog(100, "done", len(evidences)))

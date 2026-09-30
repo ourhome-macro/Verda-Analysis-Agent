@@ -9,7 +9,7 @@ from typing import Any, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
-from app.core.research_planner import MAX_REPLAN_ROUNDS, revise_plan
+from app.core.research_planner import MAX_REPLAN_ROUNDS, MAX_TOTAL_ACTIONS, revise_plan
 
 
 class AuditFlowState(TypedDict, total=False):
@@ -35,7 +35,9 @@ def _audit_route(state: AuditFlowState) -> dict[str, Any]:
         raise ValueError("invalid rework budget")
     if round_number < 1 or round_number > MAX_REPLAN_ROUNDS:
         raise ValueError("invalid replan round")
-    return {"route": "replan" if state["targets"] and round_number <= max_rounds else "write"}
+    can_replan = (state["targets"] and round_number <= max_rounds
+                  and len(state.get("previous_actions") or []) < MAX_TOTAL_ACTIONS)
+    return {"route": "replan" if can_replan else "write"}
 
 
 def _make_revision(state: AuditFlowState) -> dict[str, Any]:
