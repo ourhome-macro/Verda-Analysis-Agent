@@ -1,21 +1,24 @@
-"""SQLite job leases + persistent events; SSE observes an independent worker.
+"""SQLite job leases, events, and bounded completed-stage recovery.
 
 Single-host execution: leases bound concurrent workers even across processes.
-On process loss, mark interrupted; an explicit retry starts a new attempt from
-the beginning. This is not per-node checkpoint resume. Visitor keys stay in RAM.
+An explicit retry starts a new attempt and may reuse a completed collection
+snapshot from the prior hour. Analysis and audit always run again.
 """
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import time
+import zlib
 from contextlib import suppress
 
-from app.core import db, trace, llm, performance
+from app.core import db, trace, llm, performance, artifact_store
 from app.core.config import use_request_settings
 
 _workers = {}
 LEASE_SECONDS = 45
+STAGE_SNAPSHOT_TTL_SECONDS = 3600
 
 
 def init():
@@ -28,8 +31,66 @@ def init():
         CREATE TABLE IF NOT EXISTS research_events (
             task_id TEXT NOT NULL, seq INTEGER NOT NULL, attempt INTEGER NOT NULL,
             event_type TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY(task_id,seq));
+        CREATE TABLE IF NOT EXISTS research_stage_snapshots (
+            task_id TEXT NOT NULL, attempt INTEGER NOT NULL, stage TEXT NOT NULL,
+            input_sha256 TEXT NOT NULL, data BLOB NOT NULL, created_at REAL NOT NULL,
+            PRIMARY KEY(task_id,attempt,stage));
         """)
         c.commit()
+
+
+def stage_input_sha256(query, clarifications, mode, research_version):
+    """Bind a reusable stage result to the unchanged user request and schema."""
+    payload = json.dumps([query, clarifications, mode, research_version],
+                         ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def save_stage_snapshot(task_id, attempt, stage, input_sha256, data):
+    """Commit a completed stage. A retry may reuse only this durable result."""
+    if stage != "collect" or not isinstance(data, dict):
+        raise ValueError("unsupported stage snapshot")
+    init()
+    encoded = zlib.compress(json.dumps(data, ensure_ascii=False, allow_nan=False,
+                                       sort_keys=True, separators=(",", ":")).encode("utf-8"))
+    if len(encoded) > 32 * 1024 * 1024:
+        raise ValueError("stage snapshot exceeds 32 MiB")
+    with db._LOCK:
+        c = db._connect()
+        if not db._owned(c, "task", task_id):
+            raise PermissionError("Task is not accessible")
+        if not c.execute("SELECT 1 FROM tasks WHERE task_id=?", (task_id,)).fetchone():
+            raise LookupError("Task does not exist")
+        existing = c.execute("SELECT input_sha256,data FROM research_stage_snapshots "
+                             "WHERE task_id=? AND attempt=? AND stage=?",
+                             (task_id, attempt, stage)).fetchone()
+        if existing:
+            if existing["input_sha256"] != input_sha256 or existing["data"] != encoded:
+                raise ValueError("completed stage snapshot cannot be changed")
+            return
+        now = time.time()
+        c.execute("DELETE FROM research_stage_snapshots WHERE created_at<?", (now - 86400,))
+        c.execute("INSERT INTO research_stage_snapshots VALUES(?,?,?,?,?,?)",
+                  (task_id, attempt, stage, input_sha256, encoded, now))
+        c.commit()
+
+
+def previous_stage_snapshot(task_id, attempt, stage, input_sha256):
+    if stage != "collect":
+        raise ValueError("unsupported stage snapshot")
+    init()
+    c = db._connect()
+    if not db._owned(c, "task", task_id):
+        raise PermissionError("Task is not accessible")
+    previous_run = c.execute("SELECT status FROM research_run_metrics WHERE task_id=? AND attempt=?",
+                             (task_id, attempt - 1)).fetchone()
+    if previous_run and previous_run["status"] == "done":
+        return None  # An explicit rerun of a completed report must collect fresh data.
+    row = c.execute("SELECT data FROM research_stage_snapshots WHERE task_id=? AND attempt<? "
+                    "AND stage=? AND input_sha256=? AND created_at>=? ORDER BY attempt DESC LIMIT 1",
+                    (task_id, attempt, stage, input_sha256,
+                     time.time() - STAGE_SNAPSHOT_TTL_SECONDS)).fetchone()
+    return json.loads(zlib.decompress(row["data"])) if row else None
 
 
 def state(task_id):
@@ -67,6 +128,11 @@ def collection_checkpoint(task_id):
         return []
     run = state(task_id)
     if not run or run["attempt"] <= 1:
+        return []
+    prior = db._connect().execute(
+        "SELECT status FROM research_run_metrics WHERE task_id=? AND attempt=?",
+        (task_id, run["attempt"] - 1)).fetchone()
+    if prior and prior["status"] == "done":
         return []
     keys = {f.name for f in fields(Evidence)}
     pool = {}
@@ -137,7 +203,9 @@ async def _run(task_id, attempt, visitor_id, settings, pipeline, sub_id):
     beat = asyncio.create_task(heartbeat())
     status = "failed"
     try:
-        with db.use_visitor(visitor_id), use_request_settings(settings), llm.use_request_client(), performance.use_task(task_id):
+        with (db.use_visitor(visitor_id), use_request_settings(settings),
+              llm.use_request_client(), performance.use_task(task_id),
+              artifact_store.use_artifact_run(task_id, attempt)):
             async for event in pipeline(task_id, sub_id=sub_id):
                 if event["type"] == "node_update":
                     performance.on_node_update(task_id, event["data"])
@@ -165,7 +233,9 @@ async def _run(task_id, attempt, visitor_id, settings, pipeline, sub_id):
             c = db._connect()
             c.execute("UPDATE research_runs SET status=?,updated_at=? WHERE task_id=? AND attempt=?",
                       (status, time.time(), task_id, attempt))
-            if status != "done":
+            if status == "done":
+                c.execute("DELETE FROM research_stage_snapshots WHERE task_id=?", (task_id,))
+            else:
                 c.execute("UPDATE tasks SET status=? WHERE task_id=?", (status, task_id))
             c.commit()
         trace.cleanup(task_id)

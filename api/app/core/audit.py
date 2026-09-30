@@ -85,6 +85,7 @@ def evaluate_quality(brands, focus, claims, evidences, structured, *, min_indep_
             qr.issues.append({"issue_id": cell["cell_id"], "target": "cell:" + cell["cell_id"],
                               "severity": "high" if cell["status"] == "missing" else "medium",
                               "reason": f"{cell['brand']} × {cell['label']}：{cell['gap']}",
+                              "failure": cell["status"], "claim_ids": list(cell["claim_ids"]),
                               "brand": cell["brand"], "dimension": cell["dimension"],
                               "cell_id": cell["cell_id"], "raised_by": "L3-003"})
     return qr

@@ -151,8 +151,8 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             created_at TEXT
         );
         CREATE TABLE IF NOT EXISTS evidences (
-            evidence_id TEXT PRIMARY KEY,
-            report_id TEXT,
+            evidence_id TEXT NOT NULL,
+            report_id TEXT NOT NULL,
             source_url TEXT,
             source_type TEXT,
             domain TEXT,
@@ -161,7 +161,8 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             credibility REAL,
             collected_by TEXT,
             brand TEXT,
-            captured_at TEXT
+            captured_at TEXT,
+            PRIMARY KEY(report_id, evidence_id)
         );
         CREATE TABLE IF NOT EXISTS subscriptions (
             sub_id TEXT PRIMARY KEY,
@@ -230,9 +231,80 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             last_active TEXT,
             PRIMARY KEY(owner_id, expert_id)
         );
+        CREATE TABLE IF NOT EXISTS artifact_versions (
+            task_id TEXT NOT NULL,
+            attempt INTEGER NOT NULL,
+            cell_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            artifact_id TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            author TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            content_sha256 TEXT NOT NULL,
+            source_group TEXT NOT NULL DEFAULT '',
+            source_offsets TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL,
+            PRIMARY KEY(task_id, attempt, kind, artifact_id, version)
+        );
+        CREATE INDEX IF NOT EXISTS idx_artifact_versions_cell
+            ON artifact_versions(task_id, attempt, cell_id, kind);
         """
     )
+    _migrate_evidence_report_key(conn)
     conn.commit()
+
+
+def _migrate_evidence_report_key(conn: sqlite3.Connection) -> None:
+    """Preserve legacy rows while scoping future evidence IDs to their report."""
+    pk = [r["name"] for r in sorted(
+        (r for r in conn.execute("PRAGMA table_info(evidences)") if r["pk"]),
+        key=lambda r: r["pk"])]
+    if pk == ["report_id", "evidence_id"]:
+        return
+    if pk != ["evidence_id"]:
+        raise RuntimeError(f"Unsupported evidences primary key: {pk}")
+    # DDL is transactional here. The old global key can only have retained one
+    # row per evidence ID; embedded report JSON is untouched by this migration.
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute("ALTER TABLE evidences RENAME TO evidences_legacy_pk")
+        conn.execute("""CREATE TABLE evidences (
+            evidence_id TEXT NOT NULL, report_id TEXT NOT NULL,
+            source_url TEXT, source_type TEXT, domain TEXT, title TEXT,
+            excerpt TEXT, credibility REAL, collected_by TEXT, brand TEXT,
+            captured_at TEXT, PRIMARY KEY(report_id, evidence_id))""")
+        conn.execute("""INSERT INTO evidences
+            (evidence_id,report_id,source_url,source_type,domain,title,
+             excerpt,credibility,collected_by,brand,captured_at)
+            SELECT evidence_id,report_id,source_url,source_type,domain,title,
+                   excerpt,credibility,collected_by,brand,captured_at
+            FROM evidences_legacy_pk WHERE report_id IS NOT NULL""")
+        # Recover report-local rows already displaced by the old global key.
+        # The JSON report snapshot is the durable source for these rows.
+        for report_id, raw in conn.execute("SELECT report_id,data FROM reports"):
+            try:
+                entries = json.loads(raw or "{}").get("evidence", [])
+            except (TypeError, ValueError, AttributeError):
+                continue
+            if not isinstance(entries, list):
+                continue
+            for ev in entries:
+                if not isinstance(ev, dict) or not ev.get("evidence_id"):
+                    continue
+                conn.execute("""INSERT OR IGNORE INTO evidences
+                    (evidence_id,report_id,source_url,source_type,domain,title,
+                     excerpt,credibility,collected_by,brand,captured_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                    (ev["evidence_id"], report_id, ev.get("source_url", ""),
+                     ev.get("source_type", ""), ev.get("domain", ""),
+                     ev.get("title", ""), (ev.get("excerpt") or "")[:500],
+                     ev.get("credibility", 0.0), ev.get("collected_by", ""),
+                     ev.get("brand", ""), ev.get("captured_at", _now())))
+        conn.execute("DROP TABLE evidences_legacy_pk")
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
 
 
 # ── 任务 ────────────────────────────────────────────────
@@ -306,10 +378,15 @@ def save_report(report: Dict[str, Any], task_id: str = "") -> None:
                 len(evidence), len(claims), high, report.get("created_at", _now()),
             ),
         )
+        # Snapshot rows belong to this report; repeated report saves replace
+        # its own snapshot without disturbing any other report.
+        c.execute("DELETE FROM evidences WHERE report_id=?", (report["id"],))
         # 证据溯源单独入库，供全局证据库检索
         for ev in evidence:
+            if not ev.get("evidence_id"):
+                continue
             c.execute(
-                "INSERT OR REPLACE INTO evidences(evidence_id,report_id,source_url,source_type,"
+                "INSERT INTO evidences(evidence_id,report_id,source_url,source_type,"
                 "domain,title,excerpt,credibility,collected_by,brand,captured_at)"
                 " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                 (

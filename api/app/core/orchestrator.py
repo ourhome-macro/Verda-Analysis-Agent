@@ -32,14 +32,17 @@ from app.core.evidence_context import select_evidence
 from app.core.claim_verifier import verify_claims, supported_claims
 from app.core.source_policy import profile, classify, canonical_url, annotate_sources
 from app.core.final_audit import finalize_report
-from app.core import task_runtime
+from app.core import artifact_store, task_board, task_runtime
+from app.core.research_delegation import (analyze_cell as delegate_analyze_cell,
+                                          renew_work_lease)
 from app.core.research_contract import (VERSION as RESEARCH_VERSION, build_contract, build_matrix,
-    dimension, cell_id, source_time, stamp_claim, section_fields, section_plan, merge_rework)
-from app.core.research_planner import initial_topics, revise_plan
+    dimension, cell_id, source_time, within_window, stamp_claim, section_fields, section_plan, merge_rework)
+from app.core.research_planner import initial_topics
+from app.core.research_flow import next_replan
 from app.core.audit import evaluate_quality, decide_rework, llm_quality_review
 from app.core.config import get_settings
 from app.core.credibility import score_evidence, freshness_days
-from app.core.fetcher import domain_of, cached_fetch_page, is_public_http_url
+from app.core.fetcher import domain_of, cached_fetch_page, fetch_page, is_public_http_url
 from app.core.llm import chat, chat_json, LLMNotConfigured
 from app.core.metrics import compute_report_metrics, merge_quality_into_metrics
 from app.core.models import Evidence, Envelope, make_claim
@@ -56,6 +59,56 @@ def _now() -> str:
 
 def _sid(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex}"
+
+
+def _active_attempt(task_id: str) -> int | None:
+    run = artifact_store.current_artifact_run()
+    return run[1] if run and run[0] == task_id else None
+
+
+def _publish_evidence_artifacts(task_id: str, attempt: int | None,
+                                evidences: List[Evidence], contract: dict) -> None:
+    if attempt is None:
+        return
+    allowed = {d["key"] for d in contract["dimensions"]}
+    for ev in evidences:
+        key = next((d for d in ev.research_dimensions if d in allowed), None)
+        if key and ev.brand in contract["brands"]:
+            artifact_store.publish_artifact(
+                task_id, attempt, cell_id(ev.brand, key), "Evidence",
+                ev.evidence_id, ev.to_dict(), author=ev.collected_by or "collector",
+                source_group=ev.source_group)
+
+
+def _create_replan_child(task_id: str, attempt: int, action: dict,
+                         revision: dict, auditor: str) -> dict:
+    """An auditor creates a child work item under its leased review task."""
+    cid = action["cell_id"]
+    parent = task_board.create_work(
+        task_id, attempt, cid, "rework",
+        idempotency_key=f"replan:{revision['round']}:{cid}",
+        payload={"plan_version": revision["version"],
+                 "action_id": action["action_id"]}, max_retries=0)
+    parent_lease = task_board.claim_work(task_id, attempt, auditor,
+                                         kind="rework", cell_id=cid)
+    if not parent_lease or parent_lease["work_id"] != parent["work_id"]:
+        raise RuntimeError("replan parent work was not claimable")
+    try:
+        child = task_board.create_work(
+            task_id, attempt, cid, action["kind"],
+            idempotency_key=action["action_id"],
+            parent_id=parent["work_id"], parent_token=parent_lease["lease_token"],
+            depends_on=(parent["work_id"],),
+            payload={"plan_version": revision["version"],
+                     "action_id": action["action_id"]}, max_retries=0)
+        task_board.complete_work(task_id, attempt, parent["work_id"],
+                                 parent_lease["lease_token"],
+                                 result={"child_work_id": child["work_id"]})
+    except Exception as exc:
+        task_board.fail_work(task_id, attempt, parent["work_id"],
+                             parent_lease["lease_token"], type(exc).__name__)
+        raise
+    return child
 
 
 # ── 调研模式三档（对应需求 3）─────────────────────────────
@@ -526,7 +579,7 @@ def _overseas_market(market: str) -> bool:
 def _collect_brand(brand: str, angles: List[str], collector: str,
                    fetch_limit: int, freshness: str,
                    existing_urls: set, contract=None, dimensions=None,
-                   search_topics=None) -> Dict[str, Any]:
+                   search_topics=None, action=None) -> Dict[str, Any]:
     """Each requested dimension receives its own retrieval and fetch budget."""
     contract = contract or build_contract([brand], angles or ["功能对比", "定价策略"])
     dimensions = dimensions or contract["dimensions"]
@@ -535,9 +588,11 @@ def _collect_brand(brand: str, angles: List[str], collector: str,
     page_cache, diagnostics = {}, []
     source_profile = profile(brand)
     per_cell = max(3, min(5, (fetch_limit + len(dimensions) - 1) // max(1, len(dimensions))))
+    if action:
+        per_cell = min(per_cell, action["budget"]["fetch_pages"])
     for dim in dimensions:
         key, source = dim["key"], dim["source"]
-        topic = resolved_topics.get(key) or dim["query"]
+        topic = (action.get("query") if action else "") or resolved_topics.get(key) or dim["query"]
         if contract["industry"] == "automotive":
             auto_topic = {"feature_tree": "当前车型 配置 续航 动力",
                           "pricing_model": "当前在售车型 整车指导价 版本 地区"}.get(key)
@@ -563,16 +618,18 @@ def _collect_brand(brand: str, angles: List[str], collector: str,
                 recent += multi_search([f"{brand} user review complaints site:x.com"], num=5,
                                        site="x.com|twitter.com", freshness=freshness,
                                        source_kind="x", use_grok=True)
-        if source == "official" and source_profile["domains"]:
+        if source == "official" and source_profile["domains"] and (
+                not action or action["kind"] != "search_dated_official"):
             baseline = multi_search([f"{brand} {topic}"], num=6,
                                     site="|".join(source_profile["domains"]),
                                     freshness="noLimit", source_kind=source)
         seeds = []
-        seeds = [{"url": u, "title": f"{brand} {dim['label']}官方资料", "snippet": "", "captured_at": ""}
-                 for u in source_profile.get("dimension_seeds", {}).get(key, [])]
-        if contract["industry"] == "automotive" and key in ("feature_tree", "pricing_model"):
-            seeds = [{"url": u, "title": f"{brand} 官方产品页", "snippet": "", "captured_at": ""}
-                     for u in source_profile["seeds"]]
+        if not action or action["kind"] != "search_dated_official":
+            seeds = [{"url": u, "title": f"{brand} {dim['label']}官方资料", "snippet": "", "captured_at": ""}
+                     for u in source_profile.get("dimension_seeds", {}).get(key, [])]
+            if contract["industry"] == "automotive" and key in ("feature_tree", "pricing_model"):
+                seeds = [{"url": u, "title": f"{brand} 官方产品页", "snippet": "", "captured_at": ""}
+                         for u in source_profile["seeds"]]
         results = seeds + recent + baseline
         found += len(results)
         results.sort(key=lambda r: (
@@ -611,6 +668,9 @@ def _collect_brand(brand: str, angles: List[str], collector: str,
             pub_date = page.get("published_at") or pub_date
             if source_time(pub_date, contract) == "future":
                 continue
+            if action and action["kind"] == "search_dated_official" and (
+                    not pub_date or not within_window({"temporal": {"published_at": [pub_date]}}, contract)):
+                continue
             url = page.get("url") or url
             text = (page.get("text") or r.get("snippet", "")).strip()
             tier = classify(url, brand)
@@ -644,6 +704,46 @@ def _collect_brand(brand: str, angles: List[str], collector: str,
                             "background_search": bool(baseline), "search_results": len(results),
                             "attempted_pages": len(attempted), "accepted_evidence": fetched})
     return {"evidences": out_ev, "images": out_img, "found": found, "diagnostics": diagnostics}
+
+
+def _refetch_cell(action: dict, evidences: List[Evidence], contract: dict,
+                  collector: str) -> Dict[str, Any]:
+    """Fetch original source bodies again and admit only policy-valid replacements."""
+    original = {e.source_url: e for e in evidences
+                if e.brand == action["brand"] and action["dimension"] in e.research_dimensions}
+    accepted = []
+    attempted = 0
+    for url in action["refetch_urls"][:action["budget"]["fetch_pages"]]:
+        old = original.get(url)
+        if old is None or not is_public_http_url(url):
+            continue
+        attempted += 1
+        page = fetch_page(url)  # bypass cache for a real refetch
+        final_url = page.get("url") or url
+        tier = classify(final_url, action["brand"])
+        text = (page.get("text") or "").strip()
+        if (not is_public_http_url(final_url) or page.get("fetch_kind") not in ("body", "rendered")
+                or not text or (old.source_tier not in ("", "unclassified") and tier != old.source_tier)
+                or (action["source_role"] == "official" and tier != "official")
+                or (action["source_role"] == "community" and tier not in ("community", "media"))
+                or source_time(page.get("published_at", ""), contract) == "future"):
+            continue
+        pub_date = page.get("published_at") or ""
+        data = old.to_dict()
+        data.update(evidence_id=_sid("e"), source_url=final_url, excerpt=text[:280],
+                    full_text=text, captured_at=page.get("captured_at") or _now(),
+                    published_at=pub_date, freshness_days=freshness_days(pub_date) if pub_date else None,
+                    credibility=score_evidence(final_url, old.source_type, captured_at=pub_date,
+                                               has_publish_date=bool(pub_date), ok_fetch=True,
+                                               excerpt=text[:280]), fetch_kind=page["fetch_kind"],
+                    collected_by=collector, search_provider="refetch",
+                    source_tier="unclassified", source_group="", content_hash="",
+                    canonical_url="", provenance_reason="")
+        accepted.append(Evidence(**data))
+    return {"evidences": accepted, "images": [], "found": attempted,
+            "diagnostics": [{"brand": action["brand"], "dimension": action["dimension"],
+                             "action": "refetch_reverify", "attempted_pages": attempted,
+                             "accepted_evidence": len(accepted)}]}
 
 
 async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str, Any]]:
@@ -682,166 +782,230 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
                           "mode": mode})
     await asyncio.sleep(0.15)
 
-    # ---- 1. intake：LLM 拆解调研计划 ----
-    yield _ev("node_update", {"node": "intake", "status": "working", "expert": "L3-001"})
-    yield _ev("thought", {"id": _sid("th"), "kind": "plan", "expert": "L3-001",
-                          "text": f"收到调研需求：{query}（{cfg['label']}）。正在拆解竞品对象与调研维度……", "ts": _now()})
-    trace.set_context(task_id, "L3-001", "intake", "拆解调研计划")
-    plan = await asyncio.to_thread(_plan_research, query, clar, cfg["max_angles"])
-    for e in _drain_trace():
-        yield e
-    brands = plan["brands"]
-    focus = plan["focus"]
-    angles = plan["angles"]
-    contract = build_contract(brands, focus, clar, query)
-    search_topics = initial_topics(plan, contract)
-    plan_revisions = []
-    contract["overseas_social"] = (_overseas_market(contract.get("market", ""))
-                                   or _overseas_market(query))
-    cfg["freshness"] = contract["freshness"]
-    yield _ev("message", {"id": _sid("m"), "kind": "research_contract", "contract": contract})
-    yield _ev("message", {"id": _sid("m"), "kind": "research_plan",
-                          "version": 1, "brands": brands, "focus": focus,
-                          "search_angles": angles, "search_topics": search_topics,
-                          "omitted_brands": plan.get("omitted_brands", [])})
-    if plan.get("omitted_brands"):
-        yield _ev("thought", {"id": _sid("th"), "kind": "plan", "expert": "L3-001",
-                              "text": "本次最多研究 6 个品牌，未纳入：" + "、".join(plan["omitted_brands"]),
-                              "ts": _now()})
-    yield _ev("thought", {"id": _sid("th"), "kind": "plan", "expert": "L3-001",
-                          "text": f"锁定竞品：{'、'.join(brands)}；重点维度：{'、'.join(focus)}；"
-                                  f"将从「{'、'.join(angles)}」等角度展开多轮联网检索。", "ts": _now()})
-    yield _ev("progress", prog(7, "intake", 0))
-    yield _ev("node_update", {"node": "intake", "status": "done"})
-
-    # ---- 2. orchestrator：LLM 动态指派专家 ----
-    yield _ev("node_update", {"node": "orchestrator", "status": "working", "expert": "L3-001"})
-    trace.set_context(task_id, "L3-001", "orchestrator", "指派专家团队")
-    dispatch = await asyncio.to_thread(_dispatch_experts, query, brands, focus)
-    for e in _drain_trace():
-        yield e
-    member_ids = [m["id"] for m in dispatch["members"]]
-    lead_expert = expert_by_id(dispatch["lead"]) or {}
-    yield _ev("thought", {"id": _sid("th"), "kind": "dispatch", "expert": "L3-001",
-                          "text": f"由 {lead_expert.get('name','决策层')} 领衔组建 {len(member_ids)} 人专家队，"
-                                  f"按调研主题精准匹配专长。", "ts": _now()})
-    for m in dispatch["members"]:
-        ex = expert_by_id(m["id"]) or {}
-        yield _ev("thought", {"id": _sid("th"), "kind": "dispatch", "expert": m["id"],
-                              "text": f"指派 {ex.get('name', m['id'])}（{ex.get('role_title','')}）：{m['reason']}",
-                              "ts": _now()})
-        await asyncio.sleep(0.04)
-    # 结构化消息：编排→采集 PRODUCE 信封
-    env_collect = Envelope(msg_id="env_" + uuid.uuid4().hex[:8], sender="L3-001",
-                           receiver="collect", task_type="PRODUCE",
-                           payload={"brands": brands, "angles": angles})
-    yield _ev("message", {"id": _sid("m"), "kind": "team", "expert": "L3-001",
-                          "members": member_ids, "text": "专家队已就位，开始深度采集。",
-                          "dispatch": dispatch["members"],
-                          "envelope": {"sender": env_collect.sender, "receiver": env_collect.receiver,
-                                       "task_type": env_collect.task_type,
-                                       "payload": env_collect.payload}})
-    yield _ev("progress", prog(14, "orchestrator", 0))
-    yield _ev("node_update", {"node": "orchestrator", "status": "done"})
-
-    collector = next((m["id"] for m in dispatch["members"] if m["id"].startswith("L1")), "L1-025")
-    sentiment_expert = next((m["id"] for m in dispatch["members"]
-                             if (expert_by_id(m["id"]) or {}).get("group") == "function"), collector)
-
-    # ---- 3. collect：深度多角度真实搜索 + 抓取 ----
-    yield _ev("node_update", {"node": "collect", "status": "working", "expert": collector})
-    evidences: List[Evidence] = []
-    images: List[Dict[str, str]] = []
-    ev_by_collector: Counter = Counter()
-    collect_notes: List[str] = []
-    collection_diagnostics = []
-    seen_urls: set = set()
-    # Contract-aware collection: old checkpoints cannot silently satisfy new scope/time constraints.
-    checkpoint = task_runtime.collection_checkpoint(task_id)
-    collect_limit = max(1, min(3, get_settings().collect_brand_concurrency))
-    collect_sem = asyncio.Semaphore(collect_limit)
-
-    async def _collect_one(brand):
-        async with collect_sem:
-            trace.set_context(task_id, collector, "collect", f"采集竞品「{brand}」证据")
-            cached = [e for e in checkpoint if e.brand == brand and e.research_version == RESEARCH_VERSION
-                      and e.search_freshness == cfg["freshness"]]
-            local_seen = {(brand, dim, canonical_url(e.source_url))
-                          for e in cached for dim in e.research_dimensions}
-            missing_dims = [d for d in contract["dimensions"]
-                            if sum(d["key"] in e.research_dimensions for e in cached) < 3]
-            result = (await asyncio.to_thread(_collect_brand, brand, angles, collector,
-                                              cfg["fetch_per_brand"], cfg["freshness"],
-                                              local_seen, contract, missing_dims,
-                                              search_topics=search_topics)
-                      if missing_dims else {"evidences": [], "images": [], "found": 0})
-            result["evidences"] = cached + result["evidences"]
-            return brand, result
-
-    for brand in brands:
-        yield _ev("thought", {"id": _sid("th"), "kind": "action", "expert": collector,
-                              "text": f"按指定维度采集「{brand}」：{'、'.join(focus)}。", "ts": _now()})
-    collect_jobs = [asyncio.create_task(_collect_one(brand)) for brand in brands]
-    for job in asyncio.as_completed(collect_jobs):
-        brand, res = await job
-        trace.set_context(task_id, collector, "collect", f"采集竞品「{brand}」证据")
-        collection_diagnostics.extend({**d, "round": 0} for d in res.get("diagnostics", []))
+    attempt = _active_attempt(task_id)
+    stage_fingerprint = task_runtime.stage_input_sha256(
+        query, clar, mode, {"research_version": RESEARCH_VERSION,
+                            "search_providers": get_settings().search_providers,
+                            "mode_config": cfg, "snapshot_schema": 1})
+    prior_collect = (task_runtime.previous_stage_snapshot(
+        task_id, attempt, "collect", stage_fingerprint)
+        if attempt is not None and attempt > 1 else None)
+    if prior_collect:
+        plan = prior_collect["plan"]
+        brands, focus, angles = plan["brands"], plan["focus"], plan["angles"]
+        contract = prior_collect["contract"]
+        search_topics = prior_collect["search_topics"]
+        dispatch = prior_collect["dispatch"]
+        member_ids = [m["id"] for m in dispatch["members"]]
+        collector = prior_collect["collector"]
+        sentiment_expert = prior_collect["sentiment_expert"]
+        evidences = [Evidence(**row) for row in prior_collect["evidences"]]
+        images = prior_collect["images"]
+        ev_by_collector = Counter(prior_collect["ev_by_collector"])
+        collect_notes = prior_collect["collect_notes"]
+        collection_diagnostics = prior_collect["collection_diagnostics"]
+        seen_urls = {(ev.brand, dim, canonical_url(ev.source_url))
+                     for ev in evidences for dim in ev.research_dimensions}
+        sentiment = {}
+        plan_revisions = []
+        cfg["freshness"] = contract["freshness"]
+        task_board.register_run(task_id, attempt, contract)
+        yield _ev("message", {"id": _sid("m"), "kind": "research_contract", "contract": contract})
+        yield _ev("message", {"id": _sid("m"), "kind": "research_plan",
+                              "version": 1, "brands": brands, "focus": focus,
+                              "search_angles": angles, "search_topics": search_topics,
+                              "omitted_brands": plan.get("omitted_brands", [])})
+        yield _ev("message", {"id": _sid("m"), "kind": "team", "expert": "L3-001",
+                              "members": member_ids, "dispatch": dispatch["members"],
+                              "text": "已恢复已完成的计划与采集阶段。"})
+        yield _ev("message", {"id": _sid("m"), "kind": "stage_resume",
+                              "stage": "collect", "source_attempt": prior_collect["source_attempt"],
+                              "evidence_count": len(evidences)})
+        trace.record_manual_span(task_id, "L3-001", "collect", "恢复已完成采集阶段",
+                                 detail=f"来源尝试 {prior_collect['source_attempt']}；证据 {len(evidences)} 条")
         for e in _drain_trace():
             yield e
-        if not res["evidences"]:
-            collect_notes.append(f"「{brand}」未通过搜索获得有效结果（可能限流或不相关），已如实标注。")
-            # 记录可观测 span：本次检索动作即便无果也可追溯
+        for ev in evidences:
+            yield _ev("evidence", ev.to_dict())
+        for fig in images:
+            yield _ev("image", fig)
+        for node in ("intake", "orchestrator", "collect"):
+            yield _ev("node_update", {"node": node, "status": "done"})
+        yield _ev("progress", prog(54, "analyze", len(evidences)))
+    else:
+        # ---- 1. intake：LLM 拆解调研计划 ----
+        yield _ev("node_update", {"node": "intake", "status": "working", "expert": "L3-001"})
+        yield _ev("thought", {"id": _sid("th"), "kind": "plan", "expert": "L3-001",
+                              "text": f"收到调研需求：{query}（{cfg['label']}）。正在拆解竞品对象与调研维度……", "ts": _now()})
+        trace.set_context(task_id, "L3-001", "intake", "拆解调研计划")
+        plan = await asyncio.to_thread(_plan_research, query, clar, cfg["max_angles"])
+        for e in _drain_trace():
+            yield e
+        brands = plan["brands"]
+        focus = plan["focus"]
+        angles = plan["angles"]
+        contract = build_contract(brands, focus, clar, query)
+        search_topics = initial_topics(plan, contract)
+        plan_revisions = []
+        attempt = _active_attempt(task_id)
+        contract["overseas_social"] = (_overseas_market(contract.get("market", ""))
+                                       or _overseas_market(query))
+        cfg["freshness"] = contract["freshness"]
+        if attempt is not None:
+            task_board.register_run(task_id, attempt, contract)
+        yield _ev("message", {"id": _sid("m"), "kind": "research_contract", "contract": contract})
+        yield _ev("message", {"id": _sid("m"), "kind": "research_plan",
+                              "version": 1, "brands": brands, "focus": focus,
+                              "search_angles": angles, "search_topics": search_topics,
+                              "omitted_brands": plan.get("omitted_brands", [])})
+        if plan.get("omitted_brands"):
+            yield _ev("thought", {"id": _sid("th"), "kind": "plan", "expert": "L3-001",
+                                  "text": "本次最多研究 6 个品牌，未纳入：" + "、".join(plan["omitted_brands"]),
+                                  "ts": _now()})
+        yield _ev("thought", {"id": _sid("th"), "kind": "plan", "expert": "L3-001",
+                              "text": f"锁定竞品：{'、'.join(brands)}；重点维度：{'、'.join(focus)}；"
+                                      f"将从「{'、'.join(angles)}」等角度展开多轮联网检索。", "ts": _now()})
+        yield _ev("progress", prog(7, "intake", 0))
+        yield _ev("node_update", {"node": "intake", "status": "done"})
+
+        # ---- 2. orchestrator：LLM 动态指派专家 ----
+        yield _ev("node_update", {"node": "orchestrator", "status": "working", "expert": "L3-001"})
+        trace.set_context(task_id, "L3-001", "orchestrator", "指派专家团队")
+        dispatch = await asyncio.to_thread(_dispatch_experts, query, brands, focus)
+        for e in _drain_trace():
+            yield e
+        member_ids = [m["id"] for m in dispatch["members"]]
+        lead_expert = expert_by_id(dispatch["lead"]) or {}
+        yield _ev("thought", {"id": _sid("th"), "kind": "dispatch", "expert": "L3-001",
+                              "text": f"由 {lead_expert.get('name','决策层')} 领衔组建 {len(member_ids)} 人专家队，"
+                                      f"按调研主题精准匹配专长。", "ts": _now()})
+        for m in dispatch["members"]:
+            ex = expert_by_id(m["id"]) or {}
+            yield _ev("thought", {"id": _sid("th"), "kind": "dispatch", "expert": m["id"],
+                                  "text": f"指派 {ex.get('name', m['id'])}（{ex.get('role_title','')}）：{m['reason']}",
+                                  "ts": _now()})
+            await asyncio.sleep(0.04)
+        # 结构化消息：编排→采集 PRODUCE 信封
+        env_collect = Envelope(msg_id="env_" + uuid.uuid4().hex[:8], sender="L3-001",
+                               receiver="collect", task_type="PRODUCE",
+                               payload={"brands": brands, "angles": angles})
+        yield _ev("message", {"id": _sid("m"), "kind": "team", "expert": "L3-001",
+                              "members": member_ids, "text": "专家队已就位，开始深度采集。",
+                              "dispatch": dispatch["members"],
+                              "envelope": {"sender": env_collect.sender, "receiver": env_collect.receiver,
+                                           "task_type": env_collect.task_type,
+                                           "payload": env_collect.payload}})
+        yield _ev("progress", prog(14, "orchestrator", 0))
+        yield _ev("node_update", {"node": "orchestrator", "status": "done"})
+
+        collector = next((m["id"] for m in dispatch["members"] if m["id"].startswith("L1")), "L1-025")
+        sentiment_expert = next((m["id"] for m in dispatch["members"]
+                                 if (expert_by_id(m["id"]) or {}).get("group") == "function"), collector)
+
+        # ---- 3. collect：深度多角度真实搜索 + 抓取 ----
+        yield _ev("node_update", {"node": "collect", "status": "working", "expert": collector})
+        evidences: List[Evidence] = []
+        images: List[Dict[str, str]] = []
+        ev_by_collector: Counter = Counter()
+        collect_notes: List[str] = []
+        collection_diagnostics = []
+        seen_urls: set = set()
+        # Contract-aware collection: old checkpoints cannot silently satisfy new scope/time constraints.
+        checkpoint = task_runtime.collection_checkpoint(task_id)
+        collect_limit = max(1, min(3, get_settings().collect_brand_concurrency))
+        collect_sem = asyncio.Semaphore(collect_limit)
+
+        async def _collect_one(brand):
+            async with collect_sem:
+                trace.set_context(task_id, collector, "collect", f"采集竞品「{brand}」证据")
+                cached = [e for e in checkpoint if e.brand == brand and e.research_version == RESEARCH_VERSION
+                          and e.search_freshness == cfg["freshness"]]
+                local_seen = {(brand, dim, canonical_url(e.source_url))
+                              for e in cached for dim in e.research_dimensions}
+                missing_dims = [d for d in contract["dimensions"]
+                                if sum(d["key"] in e.research_dimensions for e in cached) < 3]
+                result = (await asyncio.to_thread(_collect_brand, brand, angles, collector,
+                                                  cfg["fetch_per_brand"], cfg["freshness"],
+                                                  local_seen, contract, missing_dims,
+                                                  search_topics=search_topics)
+                          if missing_dims else {"evidences": [], "images": [], "found": 0})
+                result["evidences"] = cached + result["evidences"]
+                return brand, result
+
+        for brand in brands:
+            yield _ev("thought", {"id": _sid("th"), "kind": "action", "expert": collector,
+                                  "text": f"按指定维度采集「{brand}」：{'、'.join(focus)}。", "ts": _now()})
+        collect_jobs = [asyncio.create_task(_collect_one(brand)) for brand in brands]
+        for job in asyncio.as_completed(collect_jobs):
+            brand, res = await job
+            trace.set_context(task_id, collector, "collect", f"采集竞品「{brand}」证据")
+            collection_diagnostics.extend({**d, "round": 0} for d in res.get("diagnostics", []))
+            for e in _drain_trace():
+                yield e
+            if not res["evidences"]:
+                collect_notes.append(f"「{brand}」未通过搜索获得有效结果（可能限流或不相关），已如实标注。")
+                # 记录可观测 span：本次检索动作即便无果也可追溯
+                trace.record_manual_span(
+                    task_id, collector, "collect", f"采集竞品「{brand}」证据",
+                    detail=f"检索角度：{('、'.join(angles))}\n搜索源：{get_settings().search_providers}（freshness={cfg['freshness']}）",
+                    decision=f"「{brand}」未返回有效结果，已如实标注、不中断。",
+                )
+                for e in _drain_trace():
+                    yield e
+                yield _ev("thought", {"id": _sid("th"), "kind": "reflect", "expert": collector,
+                                      "text": f"「{brand}」本轮搜索未返回有效结果，继续其余竞品（尽力而为，不中断）。",
+                                      "ts": _now()})
+                continue
+            yield _ev("thought", {"id": _sid("th"), "kind": "finding", "expert": collector,
+                                  "text": f"「{brand}」聚合到 {res['found']} 条去重链接，已取证 {len(res['evidences'])} 条。",
+                                  "ts": _now()})
+            for ev in res["evidences"]:
+                evidences.append(ev)
+                seen_urls.update((ev.brand, dim, canonical_url(ev.source_url))
+                                 for dim in ev.research_dimensions)
+                ev_by_collector[collector] += 1
+                d = ev.to_dict()
+                d["domain"] = domain_of(ev.source_url)
+                d["brand"] = ev.brand
+                d["full_text"] = ev.full_text
+                yield _ev("evidence", {**d})
+                yield _ev("progress", prog(min(14 + len(evidences), 50), "collect", len(evidences)))
+                await asyncio.sleep(0.01)
+            for fig in res["images"]:
+                images.append(fig)
+                yield _ev("image", fig)
+            # 可观测 span：把「检索→去重→取证」这步非 LLM 动作写进决策链路（不再空白）
+            brand_evs = [ev for ev in res["evidences"]]
+            brand_domains = {domain_of(ev.source_url) for ev in brand_evs}
+            brand_domains.discard("")
             trace.record_manual_span(
                 task_id, collector, "collect", f"采集竞品「{brand}」证据",
-                detail=f"检索角度：{('、'.join(angles))}\n搜索源：{get_settings().search_providers}（freshness={cfg['freshness']}）",
-                decision=f"「{brand}」未返回有效结果，已如实标注、不中断。",
+                detail=(f"检索角度（{len(angles)}个）：{('、'.join(angles))}\n"
+                         f"搜索源：{get_settings().search_providers}（freshness={cfg['freshness']}）"),
+                decision=(f"聚合 {res['found']} 条去重链接 → 抓取取证 {len(brand_evs)} 条，"
+                          f"覆盖 {len(brand_domains)} 个独立域名。"),
+                evidence_ids=[ev.evidence_id for ev in brand_evs[:8]],
             )
             for e in _drain_trace():
                 yield e
-            yield _ev("thought", {"id": _sid("th"), "kind": "reflect", "expert": collector,
-                                  "text": f"「{brand}」本轮搜索未返回有效结果，继续其余竞品（尽力而为，不中断）。",
-                                  "ts": _now()})
-            continue
-        yield _ev("thought", {"id": _sid("th"), "kind": "finding", "expert": collector,
-                              "text": f"「{brand}」聚合到 {res['found']} 条去重链接，已取证 {len(res['evidences'])} 条。",
-                              "ts": _now()})
-        for ev in res["evidences"]:
-            evidences.append(ev)
-            seen_urls.update((ev.brand, dim, canonical_url(ev.source_url))
-                             for dim in ev.research_dimensions)
-            ev_by_collector[collector] += 1
-            d = ev.to_dict()
-            d["domain"] = domain_of(ev.source_url)
-            d["brand"] = ev.brand
-            d["full_text"] = ev.full_text
-            yield _ev("evidence", {**d})
-            yield _ev("progress", prog(min(14 + len(evidences), 50), "collect", len(evidences)))
-            await asyncio.sleep(0.01)
-        for fig in res["images"]:
-            images.append(fig)
-            yield _ev("image", fig)
-        # 可观测 span：把「检索→去重→取证」这步非 LLM 动作写进决策链路（不再空白）
-        brand_evs = [ev for ev in res["evidences"]]
-        brand_domains = {domain_of(ev.source_url) for ev in brand_evs}
-        brand_domains.discard("")
-        trace.record_manual_span(
-            task_id, collector, "collect", f"采集竞品「{brand}」证据",
-            detail=(f"检索角度（{len(angles)}个）：{('、'.join(angles))}\n"
-                     f"搜索源：{get_settings().search_providers}（freshness={cfg['freshness']}）"),
-            decision=(f"聚合 {res['found']} 条去重链接 → 抓取取证 {len(brand_evs)} 条，"
-                      f"覆盖 {len(brand_domains)} 个独立域名。"),
-            evidence_ids=[ev.evidence_id for ev in brand_evs[:8]],
-        )
-        for e in _drain_trace():
-            yield e
-        yield _ev("thought", {"id": _sid("th"), "kind": "finding", "expert": collector,
-                              "text": f"「{brand}」累计证据库 {len(evidences)} 条。", "ts": _now()})
+            yield _ev("thought", {"id": _sid("th"), "kind": "finding", "expert": collector,
+                                  "text": f"「{brand}」累计证据库 {len(evidences)} 条。", "ts": _now()})
 
-    # Sentiment is now an evidence-backed dimension, not a separate snippet statistics pipeline.
-    sentiment = {}
+        # Sentiment is now an evidence-backed dimension, not a separate snippet statistics pipeline.
+        sentiment = {}
 
-    yield _ev("node_update", {"node": "collect", "status": "done"})
-    yield _ev("progress", prog(54, "analyze", len(evidences)))
+        yield _ev("node_update", {"node": "collect", "status": "done"})
+        yield _ev("progress", prog(54, "analyze", len(evidences)))
+
+        if attempt is not None and evidences:
+            task_runtime.save_stage_snapshot(task_id, attempt, "collect", stage_fingerprint, {
+                "source_attempt": attempt, "plan": plan, "contract": contract,
+                "search_topics": search_topics, "dispatch": dispatch,
+                "collector": collector, "sentiment_expert": sentiment_expert,
+                "evidences": [ev.to_dict() for ev in evidences], "images": images,
+                "ev_by_collector": dict(ev_by_collector), "collect_notes": collect_notes,
+                "collection_diagnostics": collection_diagnostics,
+            })
 
     if not evidences:
         yield _ev("error", {"message": "本次未能采集到任何可用证据（搜索/抓取均失败），请稍后重试或更换调研主题。"})
@@ -854,8 +1018,10 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
                           "text": "按品牌和维度选择证据原文；生成论点后核验支持关系，可信度与独立验证分别判定。", "ts": _now()})
     trace.set_context(task_id, analyst, "analyze", "交叉验证产出结构化论点")
     annotate_sources(evidences)
+    _publish_evidence_artifacts(task_id, attempt, evidences, contract)
     analysis = await asyncio.to_thread(_analyze, query, brands, focus, evidences, member_ids,
-                                       cfg["analyze_max_tokens"], contract=contract)
+                                       cfg["analyze_max_tokens"], contract=contract,
+                                       task_id=task_id, agent_id=analyst, round_number=0)
     for e in _drain_trace():
         yield e
     claims = analysis["claims"]
@@ -891,17 +1057,26 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
                           "issues": review_before.get("issues", []),
                           "suggestions": review_before.get("suggestions", [])})
     rework_rounds_done = 0
+    replan_stop_reasons = []
     quality_after = quality_before
     review_after = review_before
     envelopes = decide_rework(quality_after, review_after)
-    for round_number in range(1, min(2, max(0, cfg["rework_rounds"])) + 1):
-        if not envelopes:
+    for round_number in range(1, 3):
+        targets_for_plan = [c for env in envelopes for c in env.payload.get("cells", [])]
+        revision = next_replan(
+            contract, structured["research_matrix"], targets_for_plan,
+            search_topics, review_after, round_number, cfg["rework_rounds"],
+            evidences=evidences, issues=quality_after.issues,
+            previous_actions=[a for r in plan_revisions for a in r["actions"]],
+            fetch_budget=4)
+        if revision is None:
             break
         yield _ev("node_update", {"node": "audit", "status": "rework"})
-        targets_for_plan = [c for env in envelopes for c in env.payload.get("cells", [])]
-        revision = revise_plan(contract, structured["research_matrix"], targets_for_plan,
-                               search_topics, review_after, round_number)
         plan_revisions.append(revision)
+        if attempt is not None:
+            artifact_store.publish_artifact(
+                task_id, attempt, "plan", "PlanDelta", f"replan:{round_number}",
+                revision, author=auditor)
         yield _ev("message", {"id": _sid("m"), "kind": "replan", "plan": revision})
         trace.record_manual_span(task_id, auditor, "replan", f"第 {round_number} 轮定向重规划",
                                  detail=f"版本 {revision['version']}；目标 {len(revision['targets'])} 格",
@@ -914,37 +1089,100 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
                                   "reason": env.payload.get("reason", "按缺口返工"),
                                   "envelope": {"sender": env.sender, "receiver": env.receiver,
                                                "task_type": env.task_type, "issues": env.issues}})
-            if env.receiver != "collect":
+        child_actions = ({a["action_id"]: _create_replan_child(
+            task_id, attempt, a, revision, auditor)
+            for a in revision["actions"]} if attempt is not None else {})
+        runnable_actions = [a for a in revision["actions"] if a["kind"] != "stop_ask_user"]
+        for action in revision["actions"]:
+            if action["kind"] == "stop_ask_user":
+                if attempt is not None:
+                    claimed = task_board.claim_work(task_id, attempt, auditor,
+                                                    kind="stop_ask_user",
+                                                    cell_id=action["cell_id"])
+                    if not claimed or claimed["work_id"] != child_actions[action["action_id"]]["work_id"]:
+                        raise RuntimeError("stop work was not claimable")
+                    task_board.complete_work(task_id, attempt, claimed["work_id"],
+                                             claimed["lease_token"],
+                                             result={"requires_user_input": True})
+                replan_stop_reasons.append({"cell_id": action["cell_id"], "reason": action["reason"]})
+                yield _ev("message", {"id": _sid("m"), "kind": "replan_stop",
+                                      "cell_id": action["cell_id"], "reason": action["reason"],
+                                      "requires_user_input": True})
+        if not runnable_actions:
+            break
+        yield _ev("node_update", {"node": "collect", "status": "rework"})
+        successful_actions = []
+        for action in runnable_actions:
+            b = action["brand"]
+            dims = [d for d in contract["dimensions"] if d["key"] == action["dimension"]]
+            if not dims:
                 continue
-            yield _ev("node_update", {"node": "collect", "status": "rework"})
-            for target in env.payload.get("cells", []):
-                b = target["brand"]
-                dims = [d for d in contract["dimensions"] if d["key"] == target["dimension"]]
-                if not dims or b not in brands:
-                    continue
-                trace.set_context(task_id, collector, "collect", f"返工补采「{b}/{dims[0]['label']}」")
-                res = await asyncio.to_thread(_collect_brand, b, [dims[0]["query"]], collector,
-                                              4, cfg["freshness"], seen_urls, contract, dims,
-                                              search_topics={dims[0]["key"]: revision["search_topics"].get(
-                                                  target["cell_id"], search_topics.get(dims[0]["key"], dims[0]["query"]))})
-                collection_diagnostics.extend({**d, "round": rework_rounds_done + 1} for d in res.get("diagnostics", []))
-                for ev in res["evidences"]:
-                    evidences.append(ev)
-                    new_evidence_ids.append(ev.evidence_id)
-                    ev_by_collector[collector] += 1
-                    yield _ev("evidence", ev.to_dict())
-            yield _ev("node_update", {"node": "collect", "status": "done"})
+            trace.set_context(task_id, collector, "collect",
+                              f"返工动作 {action['kind']}「{b}/{dims[0]['label']}」")
+            claimed = (task_board.claim_work(task_id, attempt, collector,
+                                             kind=action["kind"], cell_id=action["cell_id"])
+                       if attempt is not None else None)
+            if attempt is not None and (not claimed or
+                    claimed["work_id"] != child_actions[action["action_id"]]["work_id"]):
+                raise RuntimeError("replan action work was not claimable")
+
+            async def execute_action():
+                if action["kind"] == "refetch_reverify":
+                    return await asyncio.to_thread(_refetch_cell, action, evidences, contract, collector)
+                return await asyncio.to_thread(
+                    _collect_brand, b, [dims[0]["query"]], collector,
+                    action["budget"]["fetch_pages"], cfg["freshness"], seen_urls, contract, dims,
+                    search_topics={dims[0]["key"]: action["query"]}, action=action)
+
+            try:
+                if claimed:
+                    with renew_work_lease(task_id, attempt, claimed):
+                        res = await execute_action()
+                else:
+                    res = await execute_action()
+                if claimed:
+                    task_board.complete_work(task_id, attempt, claimed["work_id"],
+                                             claimed["lease_token"],
+                                             result={"accepted_evidence": len(res["evidences"])})
+                successful_actions.append(action)
+            except Exception as exc:
+                if claimed:
+                    task_board.fail_work(task_id, attempt, claimed["work_id"],
+                                         claimed["lease_token"], type(exc).__name__)
+                replan_stop_reasons.append({"cell_id": action["cell_id"],
+                                            "reason": "返工动作失败：" + type(exc).__name__})
+                yield _ev("message", {"id": _sid("m"), "kind": "replan_stop",
+                                      "cell_id": action["cell_id"],
+                                      "reason": "返工动作失败：" + type(exc).__name__,
+                                      "requires_user_input": False})
+                continue
+            collection_diagnostics.extend({**d, "round": rework_rounds_done + 1,
+                                           "action_id": action["action_id"],
+                                           "action": action["kind"]} for d in res.get("diagnostics", []))
+            for ev in res["evidences"]:
+                evidences.append(ev)
+                new_evidence_ids.append(ev.evidence_id)
+                seen_urls.update((ev.brand, dim, canonical_url(ev.source_url))
+                                 for dim in ev.research_dimensions)
+                ev_by_collector[collector] += 1
+                yield _ev("evidence", ev.to_dict())
+        yield _ev("node_update", {"node": "collect", "status": "done"})
+        if not successful_actions:
+            break
 
         # All rework paths (including collect-only) must refresh derived artifacts.
         yield _ev("node_update", {"node": "analyze", "status": "rework"})
         trace.set_context(task_id, analyst, "analyze", "返工：重新选择证据、生成并核验论点")
         annotate_sources(evidences)
-        targets = {c["cell_id"] for env in envelopes for c in env.payload.get("cells", [])}
+        _publish_evidence_artifacts(task_id, attempt, evidences, contract)
+        targets = {a["cell_id"] for a in successful_actions}
         cell_feedback = {i["cell_id"]: i["reason"] for i in quality_after.issues if i.get("cell_id")}
         cell_feedback.update({c["cell_id"]: c["reason"] for env in envelopes for c in env.payload.get("cells", []) if c.get("reason")})
         revised = await asyncio.to_thread(_analyze, query, brands, focus, evidences, member_ids,
                                            cfg["analyze_max_tokens"],
-                                           contract=contract, target_cells=targets, cell_feedback=cell_feedback)
+                                           contract=contract, target_cells=targets,
+                                           cell_feedback=cell_feedback, task_id=task_id,
+                                           agent_id=analyst, round_number=round_number)
         # Rework only replaces failed cells. Accepted cells and their provenance remain immutable.
         claims, retained = merge_rework(claims, revised["claims"], targets)
         analysis_diagnostics.append({"round": rework_rounds_done + 1, "errors": revised.get("analysis_errors", []),
@@ -974,6 +1212,21 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
         for e in _drain_trace():
             yield e
         envelopes = decide_rework(quality_after, review_after)
+
+    # Exhaustion is an explicit graph stop. The user can supply a primary
+    # source or change the scope in a new task; this run never mutates it.
+    if cfg["rework_rounds"] and envelopes:
+        stopped = {r["cell_id"] for r in replan_stop_reasons}
+        for target in [c for env in envelopes for c in env.payload.get("cells", [])]:
+            cid = target["cell_id"]
+            if cid in stopped:
+                continue
+            reason = "契约内返工预算已用尽；请提供可核验的原始来源或重新确认研究时效"
+            replan_stop_reasons.append({"cell_id": cid, "reason": reason})
+            stopped.add(cid)
+            yield _ev("message", {"id": _sid("m"), "kind": "replan_stop",
+                                  "cell_id": cid, "reason": reason,
+                                  "requires_user_input": True})
 
     # Count actual disappeared issue keys, never turn LLM score movement into fixes.
     def issue_key(issue):
@@ -1085,6 +1338,7 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
                                "omitted_brands": plan.get("omitted_brands", []),
                                "contract_version": contract["version"]}
     report["plan_revisions"] = plan_revisions
+    report["replan_stop_reasons"] = replan_stop_reasons
     report["collection_diagnostics"] = collection_diagnostics
     report["analysis_diagnostics"] = analysis_diagnostics
     report["source_governance"] = {
@@ -1108,7 +1362,20 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
     report["performance"] = performance.snapshot(task_id)
     report["metrics"]["efficiency"]["tokens_used"] = sum(
         report["performance"].get("tokens", {}).get(k, 0) for k in ("input", "output"))
+    if attempt is not None:
+        report["task_board"] = {"attempt": attempt, **task_board.summary(task_id, attempt)}
     db.save_report(report, task_id=task_id)
+    if attempt is not None:
+        matrix = report.get("research_matrix") or {}
+        artifact_store.publish_artifact(
+            task_id, attempt, "report", "Report", report["id"],
+            {"report_id": report["id"], "quality_status": report["quality_status"],
+             "fact_covered": matrix.get("fact_covered", 0),
+             "freshness_covered": matrix.get("covered", 0),
+             "total_cells": matrix.get("total", 0),
+             "evidence_ids": [e["evidence_id"] for e in report.get("evidence", [])],
+             "claim_ids": [c["claim_id"] for c in report.get("claims", [])]},
+            author=dispatch["lead"])
     db.save_traces(task_id, report["id"], trace_spans)
     db.mark_task_done(task_id, report["id"])
     claims_by_author = Counter(c.get("author", "") for c in claims if c.get("author"))
@@ -1132,7 +1399,8 @@ def _evidence_digest(evidences: List[Evidence], limit: int = 28, *,
 
 def _analyze(query, brands, focus, evidences: List[Evidence], members: List[str],
              max_tokens_param: int = 8000, review_feedback: str = "", *, contract=None,
-             target_cells=None, cell_feedback=None) -> Dict[str, Any]:
+             target_cells=None, cell_feedback=None, task_id: str = "",
+             agent_id: str = "", round_number: int = 0) -> Dict[str, Any]:
     contract = contract or build_contract(brands, focus, query=query)
     from concurrent.futures import ThreadPoolExecutor
     from contextvars import copy_context
@@ -1140,16 +1408,32 @@ def _analyze(query, brands, focus, evidences: List[Evidence], members: List[str]
              if target_cells is None or cell_id(brand, dim["key"]) in target_cells]
     parts = []
     batch_size = max(1, min(8, get_settings().analyze_batch_size))
+    runtime = artifact_store.current_artifact_run()
+    delegated = bool(task_id and agent_id and runtime and runtime[0] == task_id)
     with ThreadPoolExecutor(max_workers=batch_size) as pool:
         for start in range(0, len(cells), batch_size):
             jobs = []
             for brand, dim in cells[start:start + batch_size]:
                 relevant = [e for e in evidences if e.brand == brand and (
                     not e.research_dimensions or dim["key"] in e.research_dimensions)]
-                jobs.append(pool.submit(copy_context().run, _analyze_brand, query, [brand], [dim["label"]],
-                                        relevant, members, min(max_tokens_param, 2200),
-                                        (cell_feedback or {}).get(cell_id(brand, dim["key"]), review_feedback),
-                                        contract=contract))
+                feedback = (cell_feedback or {}).get(cell_id(brand, dim["key"]), review_feedback)
+                if delegated:
+                    def run_selected(selected_brand, selected_dimension, selected_evidence, *,
+                                     label=dim["label"], note=feedback):
+                        return _analyze_brand(query, [selected_brand], [label],
+                                              selected_evidence, members,
+                                              min(max_tokens_param, 2200), note,
+                                              contract=contract)
+                    cell = {"cell_id": cell_id(brand, dim["key"]), "brand": brand,
+                            "dimension": dim["key"], "query": dim["query"]}
+                    evidence_ids = list(dict.fromkeys(e.evidence_id for e in relevant))[-200:]
+                    jobs.append(pool.submit(copy_context().run, delegate_analyze_cell,
+                                            task_id, runtime[1], agent_id, contract, cell,
+                                            evidence_ids, round_number, run_selected))
+                else:
+                    jobs.append(pool.submit(copy_context().run, _analyze_brand, query, [brand], [dim["label"]],
+                                            relevant, members, min(max_tokens_param, 2200), feedback,
+                                            contract=contract))
             parts.extend(job.result() for job in jobs)
     return {"claims": [c for part in parts for c in part["claims"]],
             "analysis_errors": [p["analysis_error"] for p in parts if p.get("analysis_error")],
